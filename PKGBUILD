@@ -27,11 +27,11 @@ depends=(
   cabextract python python-fonttools python-pillow systemd unzip
 )
 makedepends=(
-  # as Arch's wine package
-  alsa-lib ffmpeg gnutls gst-plugins-base-libs libcups libgphoto2 libpulse
-  libxcomposite libxinerama libxxf86vm mesa mingw-w64-gcc opencl-headers
-  opencl-icd-loader pcsclite perl samba sane sdl2 unixodbc v4l-utils
-  vulkan-headers vulkan-icd-loader
+  # as Arch's wine package, without what 10x never uses (network shares,
+  # scanners, cameras, smart cards, databases, OpenCL, video capture)
+  alsa-lib ffmpeg gnutls gst-plugins-base-libs libcups libpulse libxcomposite
+  libxinerama libxxf86vm mesa mingw-w64-gcc perl sdl2 vulkan-headers
+  vulkan-icd-loader
   wayland-protocols
 )
 optdepends=('libnotify: messages from the launcher on the desktop'
