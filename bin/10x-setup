@@ -31,6 +31,7 @@ winetricks() { "$share/winetricks" -q --unattended "$@"; }
 override() { wine reg add 'HKCU\Software\Wine\DllOverrides' /v "$1" /d "$2" /f > /dev/null; }
 
 step "Creating the Wine prefix"
+mkdir -p "$(dirname "$prefix")"
 # No Mono or Gecko: 10x uses .NET Framework (below) and no web views.
 WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" wineboot -i
 wineserver -w
