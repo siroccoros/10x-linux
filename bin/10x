@@ -82,6 +82,9 @@ update_prefix() {
     wineserver -w
 }
 
+# Which Wine build the running session was started with (by --prewarm).
+run_stamp="${XDG_RUNTIME_DIR:-/tmp}/10x-wineserver"
+
 if [[ "$1" == --prewarm ]]; then
     update_prefix
     # Keep the server up forever, boot the prefix's services, and hold the
@@ -89,6 +92,7 @@ if [[ "$1" == --prewarm ]]; then
     # hold-desktop.exe says when the desktop is up, which tells systemd the
     # session is ready (Type=notify): programs started later see its
     # displays, e.g. the primary monitor's DPI as the system DPI.
+    stat -L -c %d:%i "$wine_bin/wineserver" > "$run_stamp"
     wineserver -p
     wine "$share/hold-desktop.exe" 2>/dev/null |
         { read -r && systemd-notify --ready; cat > /dev/null; }
@@ -97,9 +101,10 @@ fi
 
 # The prefix's server must be this package's Wine: after an update of the
 # package the running one is the old build, which refuses the new client.
-for p in $(pgrep -x wineserver); do
-    tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -qxF "WINEPREFIX=$WINEPREFIX" || continue
-    if [[ "$(readlink /proc/$p/exe)" != "$(readlink -f "$wine_bin/wineserver")" ]]; then
+if [[ "$(cat "$run_stamp" 2>/dev/null)" != "$(stat -L -c %d:%i "$wine_bin/wineserver")" ]]; then
+    for p in $(pgrep -x wineserver); do
+        tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -qxF "WINEPREFIX=$WINEPREFIX" || continue
+        [[ "$(readlink /proc/$p/exe)" == "$(readlink -f "$wine_bin/wineserver")" ]] && continue
         if pgrep -f 'PureDevSoftware.10x.10x\.exe' > /dev/null; then
             msg="10x was updated. Close 10x and open it again to use the new version."
             echo "$msg" >&2; notify-send -a 10x "10x" "$msg" 2>/dev/null
@@ -107,11 +112,13 @@ for p in $(pgrep -x wineserver); do
         fi
         systemctl --user stop 10x-prewarm.service 2>/dev/null
         wineserver -k 2>/dev/null
-    fi
-done
+    done
+fi
 # Start the session if it isn't up; returns once it is.
-systemctl --user is-active -q 10x-prewarm.service || update_prefix
-systemctl --user start 10x-prewarm.service 2>/dev/null
+if ! systemctl --user is-active -q 10x-prewarm.service; then
+    update_prefix
+    systemctl --user start 10x-prewarm.service 2>/dev/null
+fi
 
 # 10x draws its own title bar: hide the buttons for window actions the
 # compositor doesn't offer, as toolkits do (an edited layout, regenerated
