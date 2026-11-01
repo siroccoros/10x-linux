@@ -1,0 +1,296 @@
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -471,26 +471,63 @@
+ 
+ 
+ /***********************************************************************
+- *           exec_wineloader
++ *           get_wineloader_env
+  *
+- * argv[0] and argv[1] must be reserved for the preloader and loader respectively.
++ * The variables exec_wineloader() adds to the environment, and the machine
++ * whose loader it starts.
+  */
+-NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info )
++WORD get_wineloader_env( int socketfd, const struct pe_image_info *pe_info,
++                         char preloader_reserve[64], char socket_env[64] )
+ {
+     WORD machine = pe_info->machine;
+     ULONGLONG res_start = pe_info->base;
+     ULONGLONG res_end = pe_info->base + pe_info->map_size;
+-    char preloader_reserve[64], socket_env[64];
+ 
+     if (pe_info->wine_fakedll) res_start = res_end = 0;
+     if (pe_info->image_flags & IMAGE_FLAGS_ComPlusNativeReady)
+         machine = is_machine_64bit( native_machine ) ? IMAGE_FILE_MACHINE_AMD64 : native_machine;
+ 
+-    signal( SIGPIPE, SIG_DFL );
+-
+-    snprintf( socket_env, sizeof(socket_env), "WINESERVERSOCKET=%u", socketfd );
+-    snprintf( preloader_reserve, sizeof(preloader_reserve), "WINEPRELOADRESERVE=%x%08x-%x%08x",
++    snprintf( socket_env, 64, "WINESERVERSOCKET=%u", socketfd );
++    snprintf( preloader_reserve, 64, "WINEPRELOADRESERVE=%x%08x-%x%08x",
+              (UINT)(res_start >> 32), (UINT)res_start, (UINT)(res_end >> 32), (UINT)res_end );
++    return machine;
++}
++
++static UINT add_wineloader_paths( struct wineloader_path *paths, UINT count, char *loader )
++{
++    if (!loader) return count;
++#ifdef HAVE_WINE_PRELOADER
++    if (asprintf( &paths[count].path, "%s-preloader", loader ) != -1) paths[count++].loader = loader;
++#endif
++    paths[count].path = loader;
++    paths[count++].loader = NULL;
++    return count;
++}
++
++/***********************************************************************
++ *           get_wineloader_paths
++ *
++ * The programs exec_wineloader() tries, in order. A preloader is followed by
++ * its loader; the caller frees each path.
++ */
++UINT get_wineloader_paths( WORD machine, struct wineloader_path paths[4] )
++{
++    UINT count = add_wineloader_paths( paths, 0, get_alternate_wineloader( machine ));
++    return add_wineloader_paths( paths, count, strdup( wineloader ));
++}
++
++
++/***********************************************************************
++ *           exec_wineloader
++ *
++ * argv[0] and argv[1] must be reserved for the preloader and loader respectively.
++ */
++NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info )
++{
++    char preloader_reserve[64], socket_env[64];
++    WORD machine = get_wineloader_env( socketfd, pe_info, preloader_reserve, socket_env );
++
++    signal( SIGPIPE, SIG_DFL );
+ 
+     putenv( preloader_reserve );
+     putenv( socket_env );
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -40,6 +40,10 @@
+ #endif
+ #include <sys/types.h>
+ #include <sys/wait.h>
++#ifdef __linux__
++# include <sched.h>
++# include <sys/mman.h>
++#endif
+ #ifdef HAVE_SYS_SYSCTL_H
+ # include <sys/sysctl.h>
+ #endif
+@@ -396,6 +400,172 @@
+ }
+ 
+ 
++static BOOL needs_new_session( const RTL_USER_PROCESS_PARAMETERS *params )
++{
++    return (peb && peb->ProcessParameters &&
++            params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
++           params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
++           params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
++           params->ConsoleHandle == NULL;
++}
++
++#ifdef __linux__
++
++/* Starting a process with fork() copies our page tables, twice since the new
++ * process is forked from a child that exits (leaving it to be reaped by init,
++ * not by us). For a large program that takes ~10 ms per process. The same two
++ * steps are done here in processes sharing our memory until they exec, as
++ * posix_spawn() does; everything they need is prepared beforehand. */
++
++#define SPAWN_STACK_SIZE 0x10000
++
++struct spawn_info
++{
++    char **argv;          /* argv[0] and argv[1] are reserved for the preloader and loader */
++    char **envp;
++    struct wineloader_path paths[4];
++    UINT path_count;
++    int stdin_fd, stdout_fd, unixdir;
++    BOOL new_session;
++    sigset_t sigmask;     /* the mask to exec with */
++    char *stack;          /* for the loader's process */
++};
++
++static int spawn_loader( void *arg )
++{
++    struct spawn_info *info = arg;
++    struct sigaction sa;
++    UINT i;
++    int sig;
++
++    /* all signals are blocked; none of our handlers may run in this process */
++    for (sig = 1; sig < _NSIG; sig++)
++    {
++        if (sigaction( sig, NULL, &sa ) || sa.sa_handler == SIG_DFL) continue;
++        if (sa.sa_handler == SIG_IGN && sig != SIGPIPE) continue;
++        sa.sa_handler = SIG_DFL;
++        sa.sa_flags = 0;
++        sigemptyset( &sa.sa_mask );
++        sigaction( sig, &sa, NULL );
++    }
++
++    if (info->new_session)
++    {
++        setsid();
++        set_stdio_fd( -1, -1 );  /* close stdin and stdout */
++    }
++    else set_stdio_fd( info->stdin_fd, info->stdout_fd );
++
++    if (info->stdin_fd != -1 && info->stdin_fd != 0) close( info->stdin_fd );
++    if (info->stdout_fd != -1 && info->stdout_fd != 1) close( info->stdout_fd );
++
++    if (info->unixdir != -1)
++    {
++        fchdir( info->unixdir );
++        close( info->unixdir );
++    }
++    sigprocmask( SIG_SETMASK, &info->sigmask, NULL );
++
++    for (i = 0; i < info->path_count; i++)
++    {
++        if (info->paths[i].loader)
++        {
++            info->argv[0] = info->paths[i].path;
++            info->argv[1] = (char *)info->paths[i].loader;
++            execve( info->argv[0], info->argv, info->envp );
++        }
++        else
++        {
++            info->argv[1] = info->paths[i].path;
++            execve( info->argv[1], info->argv + 1, info->envp );
++        }
++    }
++    _exit(1);
++}
++
++static int spawn_intermediate( void *arg )
++{
++    struct spawn_info *info = arg;
++    pid_t pid = clone( spawn_loader, info->stack + SPAWN_STACK_SIZE, CLONE_VM | CLONE_VFORK | SIGCHLD, info );
++
++    _exit( pid == -1 );
++}
++
++/* our environment with each of the given NAME=value strings set, as putenv() would */
++static char **build_loader_env( char **vars, UINT count )
++{
++    UINT size, i, j;
++    char **env;
++
++    for (size = 0; environ[size]; size++) ;
++    if (!(env = malloc( (size + count + 1) * sizeof(*env) ))) return NULL;
++    memcpy( env, environ, size * sizeof(*env) );
++    for (i = 0; i < count; i++)
++    {
++        size_t len = strchr( vars[i], '=' ) - vars[i] + 1;
++
++        for (j = 0; j < size; j++) if (!strncmp( env[j], vars[i], len )) break;
++        if (j == size) size++;
++        env[j] = vars[i];
++    }
++    env[size] = NULL;
++    return env;
++}
++
++/* returns FALSE if the process should be forked instead */
++static BOOL spawn_without_fork( const RTL_USER_PROCESS_PARAMETERS *params, int socketfd, int unixdir,
++                                char *winedebug, const struct pe_image_info *pe_info,
++                                int stdin_fd, int stdout_fd, pid_t *pid )
++{
++    static char noexec[] = "WINELOADERNOEXEC=1";
++    struct spawn_info info = { .stdin_fd = stdin_fd, .stdout_fd = stdout_fd, .unixdir = unixdir };
++    char preloader_reserve[64], socket_env[64], *vars[4], *stacks;
++    UINT count = 0, i;
++    sigset_t all;
++    WORD machine;
++
++    *pid = -1;
++    if (winedebug) vars[count++] = winedebug;
++    machine = get_wineloader_env( socketfd, pe_info, preloader_reserve, socket_env );
++    vars[count++] = preloader_reserve;
++    vars[count++] = socket_env;
++    vars[count++] = noexec;
++
++    info.new_session = needs_new_session( params );
++    if (!(info.argv = build_argv( &params->CommandLine, 2 ))) goto done;
++    if (!(info.envp = build_loader_env( vars, count ))) goto done;
++    info.path_count = get_wineloader_paths( machine, info.paths );
++
++    stacks = mmap( NULL, 2 * SPAWN_STACK_SIZE, PROT_READ | PROT_WRITE,
++                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0 );
++    if (stacks == MAP_FAILED) goto done;
++    info.stack = stacks + SPAWN_STACK_SIZE;
++
++    sigfillset( &all );
++    pthread_sigmask( SIG_SETMASK, &all, &info.sigmask );
++    *pid = clone( spawn_intermediate, stacks + SPAWN_STACK_SIZE, CLONE_VM | CLONE_VFORK | SIGCHLD, &info );
++    pthread_sigmask( SIG_SETMASK, &info.sigmask, NULL );
++    munmap( stacks, 2 * SPAWN_STACK_SIZE );
++    if (*pid == -1) WARN( "clone failed, errno %d\n", errno );
++
++done:
++    for (i = 0; i < info.path_count; i++) free( info.paths[i].path );
++    free( info.envp );
++    free( info.argv );
++    return *pid != -1;
++}
++
++#else  /* __linux__ */
++
++static BOOL spawn_without_fork( const RTL_USER_PROCESS_PARAMETERS *params, int socketfd, int unixdir,
++                                char *winedebug, const struct pe_image_info *pe_info,
++                                int stdin_fd, int stdout_fd, pid_t *pid )
++{
++    return FALSE;
++}
++
++#endif  /* __linux__ */
++
+ /***********************************************************************
+  *           spawn_process
+  */
+@@ -415,15 +585,12 @@
+         isatty(1) && is_unix_console_handle( params->hStdOutput ))
+         stdout_fd = 1;
+ 
+-    if (!(pid = fork()))  /* child */
++    if (!spawn_without_fork( params, socketfd, unixdir, winedebug, pe_info, stdin_fd, stdout_fd, &pid ) &&
++        !(pid = fork()))  /* child */
+     {
+         if (!(pid = fork()))  /* grandchild */
+         {
+-            if ((peb && peb->ProcessParameters &&
+-                 params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
+-                params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
+-                params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
+-                params->ConsoleHandle == NULL)
++            if (needs_new_session( params ))
+             {
+                 setsid();
+                 set_stdio_fd( -1, -1 );  /* close stdin and stdout */
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -241,6 +241,14 @@
+                                   const struct pe_image_info *pe_info, DWORD *info_size );
+ extern char *get_alternate_wineloader( WORD machine );
+ extern NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info );
++struct wineloader_path
++{
++    char *path;
++    const char *loader;  /* set if path is the preloader for this loader */
++};
++extern WORD get_wineloader_env( int socketfd, const struct pe_image_info *pe_info,
++                                char preloader_reserve[64], char socket_env[64] );
++extern UINT get_wineloader_paths( WORD machine, struct wineloader_path paths[4] );
+ extern NTSTATUS load_builtin( struct pe_mapping_info *pe_mapping, USHORT machine,
+                               SECTION_IMAGE_INFORMATION *info, void **module, SIZE_T *size,
+                               ULONG_PTR limit_low, ULONG_PTR limit_high, off_t offset );

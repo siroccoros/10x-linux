@@ -1,0 +1,1109 @@
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -41,6 +41,9 @@
+ #include <sys/types.h>
+ #include <sys/wait.h>
+ #ifdef __linux__
++# include <sys/syscall.h>
++#endif
++#ifdef __linux__
+ # include <sched.h>
+ # include <sys/mman.h>
+ #endif
+@@ -723,54 +726,119 @@
+ #endif
+ 
+ /***********************************************************************
++ *           get_unix_stdio_fd
++ *
++ * Get the Unix fd a Unix program uses for a standard handle it was given.
++ * Pipes have no Unix fd: they get a Unix pipe that wineserver connects to them.
++ */
++static int get_unix_stdio_fd( HANDLE handle, int std_fd )
++{
++    int fd, pipefd[2], to_unix = !std_fd;
++    NTSTATUS status;
++
++    if (!handle) return -1;
++    if (!wine_server_handle_to_fd( handle, to_unix ? FILE_READ_DATA : FILE_WRITE_DATA, &fd, NULL ))
++        return fd;
++    if (isatty( std_fd ) && is_unix_console_handle( handle )) return std_fd;
++
++#ifdef HAVE_PIPE2
++    if (pipe2( pipefd, O_CLOEXEC ) == -1)
++#endif
++    {
++        if (pipe( pipefd ) == -1) return -1;
++        fcntl( pipefd[0], F_SETFD, FD_CLOEXEC );
++        fcntl( pipefd[1], F_SETFD, FD_CLOEXEC );
++    }
++    wine_server_send_fd( pipefd[to_unix] );
++    SERVER_START_REQ( set_pipe_unix_fd )
++    {
++        req->handle  = wine_server_obj_handle( handle );
++        req->fd      = pipefd[to_unix];
++        req->to_unix = to_unix;
++        status = wine_server_call( req );
++    }
++    SERVER_END_REQ;
++    close( pipefd[to_unix] );
++    if (!status) return pipefd[!to_unix];
++    close( pipefd[!to_unix] );
++    return -1;
++}
++
++
++/***********************************************************************
+  *           fork_and_exec
+  *
+- * Fork and exec a new Unix binary, checking for errors.
++ * Fork and exec a new Unix binary, checking for errors. Returns a pidfd for it,
++ * or -1 if the system doesn't have them.
+  */
+ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, int unixdir,
+-                               const RTL_USER_PROCESS_PARAMETERS *params )
++                               const RTL_USER_PROCESS_PARAMETERS *params, int *pidfd )
+ {
+-    pid_t pid;
+-    int fd[2], stdin_fd = -1, stdout_fd = -1;
++    pid_t pid, grandchild;
++    int fd[2], pidpipe[2], ack[2], stdio_fd[3], i;
+     char **argv;
++    char c;
++    BOOL use_std_handles = (params->dwFlags & STARTF_USESTDHANDLES) != 0;
+     NTSTATUS status = STATUS_SUCCESS;
+ 
++    *pidfd = -1;
+ #ifdef HAVE_PIPE2
+-    if (pipe2( fd, O_CLOEXEC ) == -1)
++    if (pipe2( fd, O_CLOEXEC ) == -1 || pipe2( pidpipe, O_CLOEXEC ) == -1 || pipe2( ack, O_CLOEXEC ) == -1)
+ #endif
+     {
+-        if (pipe(fd) == -1) return STATUS_TOO_MANY_OPENED_FILES;
++        if (pipe( fd ) == -1) return STATUS_TOO_MANY_OPENED_FILES;
++        if (pipe( pidpipe ) == -1 || pipe( ack ) == -1) return STATUS_TOO_MANY_OPENED_FILES;
+         fcntl( fd[0], F_SETFD, FD_CLOEXEC );
+         fcntl( fd[1], F_SETFD, FD_CLOEXEC );
++        fcntl( pidpipe[0], F_SETFD, FD_CLOEXEC );
++        fcntl( pidpipe[1], F_SETFD, FD_CLOEXEC );
++        fcntl( ack[0], F_SETFD, FD_CLOEXEC );
++        fcntl( ack[1], F_SETFD, FD_CLOEXEC );
++    }
++
++    if (use_std_handles)
++    {
++        /* the program gets the handles it was given, as on Windows */
++        stdio_fd[0] = get_unix_stdio_fd( params->hStdInput, 0 );
++        stdio_fd[1] = get_unix_stdio_fd( params->hStdOutput, 1 );
++        stdio_fd[2] = params->hStdError == params->hStdOutput ? stdio_fd[1]
++                      : get_unix_stdio_fd( params->hStdError, 2 );
++    }
++    else
++    {
++        stdio_fd[0] = stdio_fd[1] = -1;
++        stdio_fd[2] = 2;
++        if (wine_server_handle_to_fd( params->hStdInput, FILE_READ_DATA, &stdio_fd[0], NULL ) &&
++            isatty(0) && is_unix_console_handle( params->hStdInput ))
++            stdio_fd[0] = 0;
++
++        if (wine_server_handle_to_fd( params->hStdOutput, FILE_WRITE_DATA, &stdio_fd[1], NULL ) &&
++            isatty(1) && is_unix_console_handle( params->hStdOutput ))
++            stdio_fd[1] = 1;
+     }
+ 
+-    if (wine_server_handle_to_fd( params->hStdInput, FILE_READ_DATA, &stdin_fd, NULL ) &&
+-        isatty(0) && is_unix_console_handle( params->hStdInput ))
+-        stdin_fd = 0;
+-
+-    if (wine_server_handle_to_fd( params->hStdOutput, FILE_WRITE_DATA, &stdout_fd, NULL ) &&
+-        isatty(1) && is_unix_console_handle( params->hStdOutput ))
+-        stdout_fd = 1;
+-
+     if (!(pid = fork()))  /* child */
+     {
++        close( ack[1] );
+         if (!(pid = fork()))  /* grandchild */
+         {
+             close( fd[0] );
+ 
+-            if ((peb && peb->ProcessParameters &&
+-                 params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
+-                params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
+-                params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
+-                params->ConsoleHandle == NULL)
++            if (needs_new_session( params ))
+             {
+                 setsid();
+-                set_stdio_fd( -1, -1 );  /* close stdin and stdout */
++                if (!use_std_handles) stdio_fd[0] = stdio_fd[1] = -1;  /* close stdin and stdout */
+             }
+-            else set_stdio_fd( stdin_fd, stdout_fd );
++            if (use_std_handles && stdio_fd[2] == -1)
++            {
++                stdio_fd[2] = open( "/dev/null", O_WRONLY );
++                if (stdio_fd[2] == 2) stdio_fd[2] = dup( 2 );  /* stderr was closed */
++            }
++            set_stdio_fd( stdio_fd[0], stdio_fd[1] );
++            if (stdio_fd[2] != 2) dup2( stdio_fd[2], 2 );
+ 
+-            if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
+-            if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
++            for (i = 0; i < 3; i++)
++                if (stdio_fd[i] > 2 && (i < 2 || stdio_fd[2] != stdio_fd[1])) close( stdio_fd[i] );
+ 
+             /* Reset signals that we previously set to SIG_IGN */
+             signal( SIGPIPE, SIG_DFL );
+@@ -800,27 +868,77 @@
+             write( fd[1], &status, sizeof(status) );
+             _exit(1);
+         }
+-        _exit(0); /* child if fork succeeded */
++        /* child if fork succeeded: keep the grandchild's pid from being reused
++         * until the parent has a pidfd for it */
++        write( pidpipe[1], &pid, sizeof(pid) );
++        read( ack[0], &c, 1 );
++        _exit(0);
+     }
+     close( fd[1] );
++    close( pidpipe[1] );
++    close( ack[0] );
+ 
+     if (pid != -1)
+     {
+-        /* reap child */
+         pid_t wret;
++
++#ifdef SYS_pidfd_open
++        if (read( pidpipe[0], &grandchild, sizeof(grandchild) ) == sizeof(grandchild))
++            *pidfd = syscall( SYS_pidfd_open, grandchild, 0 );
++#endif
++        close( ack[1] );  /* let the child exit */
++
++        /* reap child */
+         do {
+             wret = waitpid(pid, NULL, 0);
+         } while (wret < 0 && errno == EINTR);
+         read( fd[0], &status, sizeof(status) );  /* if we read something, exec or second fork failed */
+     }
+-    else status = STATUS_NO_MEMORY;
++    else
++    {
++        close( ack[1] );
++        status = STATUS_NO_MEMORY;
++    }
+ 
+     close( fd[0] );
+-    if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
+-    if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
++    close( pidpipe[0] );
++    for (i = 0; i < 3; i++)
++        if (stdio_fd[i] > 2 && (i < 2 || stdio_fd[2] != stdio_fd[1])) close( stdio_fd[i] );
++    if (status && *pidfd != -1)
++    {
++        close( *pidfd );
++        *pidfd = -1;
++    }
+     return status;
+ }
+ 
++
++/***********************************************************************
++ *           register_unix_process
++ *
++ * Give a Unix program started by a Windows one handles that wait for it like a process.
++ */
++static void register_unix_process( int pidfd, ACCESS_MASK process_access, ACCESS_MASK thread_access,
++                                   const OBJECT_ATTRIBUTES *process_attr, HANDLE *process, HANDLE *thread,
++                                   ULONG *process_id )
++{
++    wine_server_send_fd( pidfd );
++    SERVER_START_REQ( new_unix_process )
++    {
++        req->pidfd         = pidfd;
++        req->access        = process_access;
++        req->thread_access = thread_access;
++        req->attributes    = process_attr ? process_attr->Attributes : 0;
++        if (!wine_server_call( req ))
++        {
++            *process    = wine_server_ptr_handle( reply->handle );
++            *thread     = wine_server_ptr_handle( reply->thread );
++            *process_id = reply->pid;
++        }
++    }
++    SERVER_END_REQ;
++}
++
+ static NTSTATUS alloc_handle_list( const PS_ATTRIBUTE *handles_attr, obj_handle_t **handles, data_size_t *handles_len )
+ {
+     SIZE_T count, i;
+@@ -863,7 +981,7 @@
+     char *unix_name = NULL;
+     struct startup_info_data *startup_info = NULL;
+     ULONG startup_info_size, env_size;
+-    int unixdir, socketfd[2] = { -1, -1 };
++    int unixdir, pidfd, socketfd[2] = { -1, -1 };
+     struct pe_image_info pe_info;
+     ULONG process_id, thread_id;
+     USHORT machine = 0;
+@@ -928,9 +1046,28 @@
+     InitializeObjectAttributes( &attr, &path, OBJ_CASE_INSENSITIVE, 0, 0 );
+     if ((status = get_pe_file_info( &attr, &nt_name, &unix_name, &file_handle, &pe_info )))
+     {
+-        if (status == STATUS_INVALID_IMAGE_NOT_MZ && !fork_and_exec( &attr, unix_name, unixdir, params ))
++        if (status == STATUS_INVALID_IMAGE_NOT_MZ && !fork_and_exec( &attr, unix_name, unixdir, params, &pidfd ))
+         {
+-            *process_handle_ptr = *thread_handle_ptr = 0;
++            process_handle = thread_handle = 0;
++            process_id = 0;
++            if (pidfd != -1)
++            {
++                register_unix_process( pidfd, process_access, thread_access, process_attr,
++                                       &process_handle, &thread_handle, &process_id );
++                close( pidfd );
++            }
++            *process_handle_ptr = process_handle;
++            *thread_handle_ptr = thread_handle;
++            for (i = 0; i < attr_count; i++)
++            {
++                if (ps_attr->Attributes[i].Attribute == PS_ATTRIBUTE_CLIENT_ID)
++                {
++                    CLIENT_ID id = make_client_id( process_id, 0 );
++                    SIZE_T size = min( ps_attr->Attributes[i].Size, sizeof(id) );
++                    memcpy( ps_attr->Attributes[i].ValuePtr, &id, size );
++                    if (ps_attr->Attributes[i].ReturnLength) *ps_attr->Attributes[i].ReturnLength = size;
++                }
++            }
+             memset( info, 0, sizeof(*info) );
+             free( unix_name );
+             free( nt_name.Buffer );
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -1308,6 +1308,40 @@
+ 
+ 
+ 
++struct set_pipe_unix_fd_request
++{
++    struct request_header __header;
++    obj_handle_t handle;
++    int          fd;
++    int          to_unix;
++};
++struct set_pipe_unix_fd_reply
++{
++    struct reply_header __header;
++};
++
++
++
++struct new_unix_process_request
++{
++    struct request_header __header;
++    int          pidfd;
++    unsigned int access;
++    unsigned int thread_access;
++    unsigned int attributes;
++    char __pad_28[4];
++};
++struct new_unix_process_reply
++{
++    struct reply_header __header;
++    process_id_t pid;
++    obj_handle_t handle;
++    obj_handle_t thread;
++    char __pad_20[4];
++};
++
++
++
+ struct get_process_debug_info_request
+ {
+     struct request_header __header;
+@@ -6270,6 +6304,8 @@
+     REQ_terminate_process,
+     REQ_terminate_thread,
+     REQ_get_process_info,
++    REQ_set_pipe_unix_fd,
++    REQ_new_unix_process,
+     REQ_get_process_debug_info,
+     REQ_get_process_image_name,
+     REQ_get_process_vm_counters,
+@@ -6586,6 +6622,8 @@
+     struct terminate_process_request terminate_process_request;
+     struct terminate_thread_request terminate_thread_request;
+     struct get_process_info_request get_process_info_request;
++    struct set_pipe_unix_fd_request set_pipe_unix_fd_request;
++    struct new_unix_process_request new_unix_process_request;
+     struct get_process_debug_info_request get_process_debug_info_request;
+     struct get_process_image_name_request get_process_image_name_request;
+     struct get_process_vm_counters_request get_process_vm_counters_request;
+@@ -6900,6 +6938,8 @@
+     struct terminate_process_reply terminate_process_reply;
+     struct terminate_thread_reply terminate_thread_reply;
+     struct get_process_info_reply get_process_info_reply;
++    struct set_pipe_unix_fd_reply set_pipe_unix_fd_reply;
++    struct new_unix_process_reply new_unix_process_reply;
+     struct get_process_debug_info_reply get_process_debug_info_reply;
+     struct get_process_image_name_reply get_process_image_name_reply;
+     struct get_process_vm_counters_reply get_process_vm_counters_reply;
+@@ -7201,6 +7241,6 @@
+     struct alpc_create_port_reply alpc_create_port_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 964
++#define SERVER_PROTOCOL_VERSION 966
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+--- a/server/async.c
++++ b/server/async.c
+@@ -813,7 +813,7 @@
+ }
+ 
+ /* allocate iosb struct */
+-static struct iosb *create_iosb( const void *in_data, data_size_t in_size, data_size_t out_size )
++struct iosb *create_iosb( const void *in_data, data_size_t in_size, data_size_t out_size )
+ {
+     struct iosb *iosb;
+ 
+--- a/server/file.h
++++ b/server/file.h
+@@ -266,6 +266,7 @@
+ extern void async_wake_up( struct async_queue *queue, unsigned int status );
+ extern struct completion *fd_get_completion( struct fd *fd, apc_param_t *p_key );
+ extern void fd_copy_completion( struct fd *src, struct fd *dst );
++extern struct iosb *create_iosb( const void *in_data, data_size_t in_size, data_size_t out_size );
+ extern struct iosb *async_get_iosb( struct async *async );
+ extern struct thread *async_get_thread( struct async *async );
+ extern struct async *find_pending_async( struct async_queue *queue );
+--- a/server/named_pipe.c
++++ b/server/named_pipe.c
+@@ -28,6 +28,10 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/types.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <unistd.h>
+ 
+ #include "ntstatus.h"
+ #include "windef.h"
+@@ -65,6 +69,7 @@
+     struct list          message_queue;
+     struct async_queue   read_q;     /* read queue */
+     struct async_queue   write_q;    /* write queue */
++    struct list          bridges;    /* Unix programs reading or writing this end */
+ };
+ 
+ struct pipe_server
+@@ -396,6 +401,206 @@
+     free( message );
+ }
+ 
++/* A pipe end given to a Unix program as its standard input or output (see
++ * fork_and_exec in ntdll): Wine's pipes have no Unix file descriptor, so the
++ * bridge moves the data between the pipe end and a Unix pipe, reading the pipe
++ * end's messages like ReadFile or queueing them like WriteFile. Like the
++ * program's handle on Windows, it holds the pipe end until the program closes
++ * its side. */
++struct pipe_bridge
++{
++    struct object        obj;        /* object header */
++    struct list          entry;      /* entry in the pipe end's bridges */
++    struct fd           *fd;         /* our end of the Unix pipe */
++    struct pipe_end     *pipe_end;   /* the pipe end, while the bridge is open */
++    int                  to_unix;    /* the program reads the pipe end */
++    struct timeout_user *closing;    /* closing outside of pipe operations */
++};
++
++static data_size_t pipe_end_get_avail( struct pipe_end *pipe_end );
++static void pipe_bridge_dump( struct object *obj, int verbose );
++static void pipe_bridge_destroy( struct object *obj );
++static void pipe_bridge_poll_event( struct fd *fd, int event );
++
++static const struct object_ops pipe_bridge_ops =
++{
++    .size    = sizeof(struct pipe_bridge),
++    .type    = &no_type,
++    .dump    = pipe_bridge_dump,
++    .destroy = pipe_bridge_destroy,
++};
++
++static const struct fd_ops pipe_bridge_fd_ops =
++{
++    .poll_event = pipe_bridge_poll_event,
++};
++
++/* We call async_terminate in our reselect implementation, which causes recursive reselect.
++ * We're not interested in such reselect calls, so we ignore them. */
++static int ignore_reselect;
++
++/* data a bridge queues for the reader before it waits for it to read */
++#define PIPE_BRIDGE_BUFFER 65536
++
++static void pipe_bridge_dump( struct object *obj, int verbose )
++{
++    struct pipe_bridge *bridge = (struct pipe_bridge *)obj;
++    assert( obj->ops == &pipe_bridge_ops );
++    fprintf( stderr, "Pipe bridge fd=%p %s\n", bridge->fd, bridge->to_unix ? "to Unix" : "from Unix" );
++}
++
++static void pipe_bridge_destroy( struct object *obj )
++{
++    struct pipe_bridge *bridge = (struct pipe_bridge *)obj;
++    assert( obj->ops == &pipe_bridge_ops );
++    if (bridge->closing) remove_timeout_user( bridge->closing );
++    if (bridge->fd) release_object( bridge->fd );
++}
++
++static void pipe_bridge_close( struct pipe_bridge *bridge )
++{
++    struct pipe_end *pipe_end = bridge->pipe_end;
++
++    if (!pipe_end) return;
++    bridge->pipe_end = NULL;
++    list_remove( &bridge->entry );
++    release_object( bridge->fd );  /* the program sees the end of its input, or a broken pipe */
++    bridge->fd = NULL;
++    release_object( pipe_end );
++    release_object( bridge );
++}
++
++static void pipe_bridge_closing( void *private )
++{
++    struct pipe_bridge *bridge = private;
++
++    bridge->closing = NULL;
++    pipe_bridge_close( bridge );
++}
++
++/* close the bridge once the pipe operation in progress is done with the pipe end */
++static void pipe_bridge_finish( struct pipe_bridge *bridge )
++{
++    if (bridge->closing || !bridge->pipe_end) return;
++    set_fd_events( bridge->fd, -1 );
++    bridge->closing = add_timeout_user( 0, pipe_bridge_closing, bridge );
++}
++
++/* read the program's output while the reader has room for it */
++static void pipe_bridge_update( struct pipe_bridge *bridge )
++{
++    struct pipe_end *reader;
++
++    if (bridge->closing || !bridge->pipe_end) return;
++    if (!(reader = bridge->pipe_end->connection))
++    {
++        pipe_bridge_finish( bridge );  /* nobody reads it any more */
++        return;
++    }
++    set_fd_events( bridge->fd, pipe_end_get_avail( reader ) < max( reader->buffer_size, PIPE_BRIDGE_BUFFER ) ? POLLIN : -1 );
++}
++
++static void reselect_read_queue( struct pipe_end *pipe_end, int reselect_write );
++
++/* queue the program's output for the reader, as if written to the pipe end */
++static void pipe_bridge_read( struct pipe_bridge *bridge )
++{
++    struct pipe_end *reader = bridge->pipe_end->connection;
++    char buffer[PIPE_BRIDGE_BUFFER];
++    struct iosb *iosb;
++    ssize_t size;
++
++    if (!reader)
++    {
++        pipe_bridge_finish( bridge );
++        return;
++    }
++    if ((size = read( get_unix_fd( bridge->fd ), buffer, sizeof(buffer) )) == -1 && (errno == EAGAIN || errno == EINTR))
++        return;
++    if (size <= 0)
++    {
++        pipe_bridge_finish( bridge );  /* the program closed its output */
++        return;
++    }
++    if (!(iosb = create_iosb( buffer, size, 0 ))) return;
++    if (!queue_message( reader, iosb )) clear_error();
++    release_object( iosb );
++    grab_object( bridge );
++    reselect_read_queue( reader, 0 );
++    pipe_bridge_update( bridge );
++    release_object( bridge );
++}
++
++/* write the messages queued on the pipe end into the program's input; returns
++ * whether any were written */
++static int pipe_bridge_write( struct pipe_bridge *bridge )
++{
++    struct pipe_end *pipe_end = bridge->pipe_end;
++    struct pipe_message *message;
++    data_size_t left;
++    ssize_t size;
++    int written = 0, reselecting;
++
++    if (bridge->closing || !pipe_end) return 0;
++    reselecting = ignore_reselect;
++    ignore_reselect = 1;  /* completing a write must not read the queue under us */
++    while (!list_empty( &pipe_end->message_queue ))
++    {
++        message = LIST_ENTRY( list_head(&pipe_end->message_queue), struct pipe_message, entry );
++        if ((left = message->iosb->in_size - message->read_pos))
++        {
++            size = write( get_unix_fd( bridge->fd ), (const char *)message->iosb->in_data + message->read_pos, left );
++            if (size == -1)
++            {
++                if (errno == EAGAIN || errno == EINTR) set_fd_events( bridge->fd, POLLOUT );
++                else pipe_bridge_finish( bridge );  /* the program closed its input */
++                goto done;
++            }
++            message->read_pos += size;
++            written = 1;
++            if (size < left)
++            {
++                set_fd_events( bridge->fd, POLLOUT );
++                goto done;
++            }
++        }
++        wake_message( message, message->iosb->in_size );
++        free_message( message );
++        written = 1;
++    }
++    if (pipe_end->state != FILE_PIPE_CONNECTED_STATE) pipe_bridge_finish( bridge );  /* all of it was written */
++    else set_fd_events( bridge->fd, 0 );  /* only notice the program closing its input */
++done:
++    ignore_reselect = reselecting;
++    return written;
++}
++
++static void pipe_bridge_poll_event( struct fd *fd, int event )
++{
++    struct pipe_bridge *bridge = get_fd_user( fd );
++
++    if (!bridge->to_unix) pipe_bridge_read( bridge );
++    else if (event & (POLLERR | POLLHUP)) pipe_bridge_finish( bridge );
++    else
++    {
++        grab_object( bridge );
++        reselect_read_queue( bridge->pipe_end, 0 );
++        release_object( bridge );
++    }
++}
++
++/* let the bridges of a pipe end know that it changed */
++static void pipe_end_wake_bridges( struct pipe_end *pipe_end )
++{
++    struct pipe_bridge *bridge, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( bridge, next, &pipe_end->bridges, struct pipe_bridge, entry )
++    {
++        if (bridge->to_unix) pipe_bridge_write( bridge );
++        else pipe_bridge_update( bridge );
++    }
++}
++
+ static void pipe_end_disconnect( struct pipe_end *pipe_end, unsigned int status )
+ {
+     struct pipe_end *connection = pipe_end->connection;
+@@ -417,6 +622,7 @@
+         release_object( async );
+     }
+     if (status == STATUS_PIPE_DISCONNECTED) set_fd_signaled( pipe_end->fd, 0 );
++    pipe_end_wake_bridges( pipe_end );
+ 
+     if (connection)
+     {
+@@ -960,15 +1166,17 @@
+ 
+ /* We call async_terminate in our reselect implementation, which causes recursive reselect.
+  * We're not interested in such reselect calls, so we ignore them. */
+-static int ignore_reselect;
+ 
+ static void reselect_write_queue( struct pipe_end *pipe_end );
+ 
+ static void reselect_read_queue( struct pipe_end *pipe_end, int reselect_write )
+ {
++    struct pipe_bridge *bridge, *next;
+     struct async *async;
+ 
+     ignore_reselect = 1;
++    LIST_FOR_EACH_ENTRY_SAFE( bridge, next, &pipe_end->bridges, struct pipe_bridge, entry )
++        if (bridge->to_unix && pipe_bridge_write( bridge )) reselect_write = 1;
+     while (!list_empty( &pipe_end->message_queue ) && (async = find_pending_async( &pipe_end->read_q )))
+     {
+         message_queue_read( pipe_end, async );
+@@ -983,6 +1191,8 @@
+             fd_async_wake_up( pipe_end->connection->fd, ASYNC_TYPE_WAIT, STATUS_SUCCESS );
+         else if (reselect_write)
+             reselect_write_queue( pipe_end->connection );
++        /* a bridge writing to this end waits for room */
++        if (reselect_write && pipe_end->connection) pipe_end_wake_bridges( pipe_end->connection );
+     }
+ }
+ 
+@@ -1351,6 +1561,7 @@
+     init_async_queue( &pipe_end->read_q );
+     init_async_queue( &pipe_end->write_q );
+     list_init( &pipe_end->message_queue );
++    list_init( &pipe_end->bridges );
+ }
+ 
+ static struct pipe_server *create_pipe_server( struct named_pipe *pipe, unsigned int options,
+@@ -1636,3 +1847,54 @@
+ 
+     release_object( pipe_end );
+ }
++
++/* connect a pipe end to a Unix program's standard input or output */
++DECL_HANDLER(set_pipe_unix_fd)
++{
++    struct pipe_bridge *bridge;
++    struct pipe_end *pipe_end;
++    struct object *obj;
++    int unix_fd;
++
++    if ((unix_fd = thread_get_inflight_fd( current, req->fd )) == -1)
++    {
++        set_error( STATUS_INVALID_HANDLE );
++        return;
++    }
++    fcntl( unix_fd, F_SETFL, fcntl( unix_fd, F_GETFL ) | O_NONBLOCK );
++    if (!(obj = get_handle_obj( current->process, req->handle,
++                                req->to_unix ? FILE_READ_DATA : FILE_WRITE_DATA, NULL )))
++    {
++        close( unix_fd );
++        return;
++    }
++    if (obj->ops != &pipe_server_ops && obj->ops != &pipe_client_ops)
++    {
++        set_error( STATUS_OBJECT_TYPE_MISMATCH );
++        close( unix_fd );
++        release_object( obj );
++        return;
++    }
++    pipe_end = (struct pipe_end *)obj;
++
++    if (!(bridge = alloc_object( &pipe_bridge_ops )))
++    {
++        close( unix_fd );
++        release_object( obj );
++        return;
++    }
++    bridge->pipe_end = NULL;
++    bridge->to_unix  = req->to_unix;
++    bridge->closing  = NULL;
++    if (!(bridge->fd = create_anonymous_fd( &pipe_bridge_fd_ops, unix_fd, &bridge->obj, 0 )))
++    {
++        release_object( bridge );
++        release_object( obj );
++        return;
++    }
++    bridge->pipe_end = pipe_end;  /* holds the reference from get_handle_obj; the pipe end holds the bridge's */
++    list_add_tail( &pipe_end->bridges, &bridge->entry );
++
++    if (bridge->to_unix) reselect_read_queue( pipe_end, 0 );
++    else pipe_bridge_update( bridge );
++}
+--- a/server/process.c
++++ b/server/process.c
+@@ -34,6 +34,11 @@
+ #include <sys/socket.h>
+ #include <unistd.h>
+ #include <poll.h>
++#ifdef __linux__
++# include <sys/ioctl.h>
++# include <sys/syscall.h>
++# include <sys/wait.h>
++#endif
+ #ifdef HAVE_SYS_PARAM_H
+ # include <sys/param.h>
+ #endif
+@@ -869,6 +874,146 @@
+                                              access, &process_ops );
+ }
+ 
++/* A Unix program started by a Windows one (see fork_and_exec in ntdll). It has
++ * no Wine threads, so it is tracked through a pidfd: it gets a process id, its
++ * handle is signaled when it exits, and it reports its exit status as the exit
++ * code (128 + the signal number if a signal killed it, as shells report it). */
++struct unix_process
++{
++    struct object        obj;          /* object header */
++    struct object       *sync;         /* sync object for wait/signal */
++    struct fd           *fd;           /* pidfd */
++    struct timeout_user *timeout;      /* waiting for the exit status */
++    timeout_t            retry;        /* delay before asking for it again */
++    process_id_t         id;           /* id of the process */
++    process_id_t         parent_id;    /* id of the process that started it */
++    int                  exit_code;    /* exit code, STILL_ACTIVE while running */
++    int                  terminated;   /* exit code set by TerminateProcess */
++    timeout_t            start_time;   /* absolute time at process start */
++    timeout_t            end_time;     /* absolute time at process end */
++};
++
++static void unix_process_dump( struct object *obj, int verbose );
++static struct object *unix_process_get_sync( struct object *obj );
++static void unix_process_destroy( struct object *obj );
++static void unix_process_poll_event( struct fd *fd, int event );
++
++static const struct object_ops unix_process_ops =
++{
++    .size       = sizeof(struct unix_process),
++    .type       = &process_type,
++    .dump       = unix_process_dump,
++    .get_sync   = unix_process_get_sync,
++    .map_access = process_map_access,
++    .get_sd     = process_get_sd,
++    .destroy    = unix_process_destroy,
++};
++
++static const struct fd_ops unix_process_fd_ops =
++{
++    .poll_event = unix_process_poll_event,
++};
++
++static void unix_process_dump( struct object *obj, int verbose )
++{
++    struct unix_process *process = (struct unix_process *)obj;
++    assert( obj->ops == &unix_process_ops );
++    fprintf( stderr, "Unix process id=%04x exit_code=%d\n", process->id, process->exit_code );
++}
++
++static struct object *unix_process_get_sync( struct object *obj )
++{
++    struct unix_process *process = (struct unix_process *)obj;
++    assert( obj->ops == &unix_process_ops );
++    return grab_object( process->sync );
++}
++
++static void unix_process_destroy( struct object *obj )
++{
++    struct unix_process *process = (struct unix_process *)obj;
++    assert( obj->ops == &unix_process_ops );
++
++    if (process->timeout) remove_timeout_user( process->timeout );
++    if (process->fd) release_object( process->fd );
++    if (process->id) free_ptid( process->id );
++    if (process->sync) release_object( process->sync );
++}
++
++#ifdef __linux__
++/* the first version of struct pidfd_info, from <linux/pidfd.h> (which clashes with <fcntl.h>) */
++struct pidfd_exit_info
++{
++    unsigned long long mask;
++    unsigned long long cgroupid;
++    unsigned int ids[11];
++    int exit_code;
++};
++#define PIDFD_INFO_EXIT 0x8
++#define PIDFD_GET_INFO _IOWR( 0xff, 11, struct pidfd_exit_info )
++#endif
++
++/* get the exit status once the program has exited and been reaped */
++static int get_unix_process_status( struct unix_process *process, int *status )
++{
++#ifdef PIDFD_GET_INFO
++    struct pidfd_exit_info info = { .mask = PIDFD_INFO_EXIT };
++
++    if (ioctl( get_unix_fd( process->fd ), PIDFD_GET_INFO, &info ) == -1)
++    {
++        *status = 0;
++        return 1;  /* no exit status from this kernel */
++    }
++    if (!(info.mask & PIDFD_INFO_EXIT)) return 0;
++    *status = info.exit_code;
++#else
++    *status = 0;
++#endif
++    return 1;
++}
++
++static void check_unix_process_exit( void *private )
++{
++    struct unix_process *process = private;
++    int status;
++
++    process->timeout = NULL;
++    if (!get_unix_process_status( process, &status ))
++    {
++        /* the pidfd signals the exit before the status is available: that
++         * comes when its parent reaps it, normally within a millisecond */
++        process->retry = process->retry ? min( process->retry * 2, TICKS_PER_SEC / 10 ) : TICKS_PER_SEC / 1000;
++        process->timeout = add_timeout_user( -process->retry, check_unix_process_exit, process );
++        return;
++    }
++    if (!process->terminated)
++        process->exit_code = WIFSIGNALED( status ) ? 128 + WTERMSIG( status ) : WEXITSTATUS( status );
++    process->end_time = current_time;
++    signal_sync( process->sync );
++}
++
++static void unix_process_poll_event( struct fd *fd, int event )
++{
++    struct unix_process *process = get_fd_user( fd );
++
++    set_fd_events( fd, -1 );
++    check_unix_process_exit( process );
++}
++
++/* get a Unix program from a handle, if the handle is one */
++static struct unix_process *get_unix_process_from_handle( obj_handle_t handle, unsigned int access )
++{
++    struct object *obj;
++
++    if (!(obj = get_handle_obj( current->process, handle, 0, NULL ))) return NULL;
++    if (obj->ops != &unix_process_ops)
++    {
++        release_object( obj );
++        return NULL;
++    }
++    release_object( obj );
++    return (struct unix_process *)get_handle_obj( current->process, handle, access, &unix_process_ops );
++}
++
+ /* terminate a process with the given exit code */
+ static void terminate_process( struct process *process, struct thread *skip, int exit_code )
+ {
+@@ -1446,8 +1591,16 @@
+ /* open a handle to a process */
+ DECL_HANDLER(open_process)
+ {
+-    struct process *process = get_process_from_id( req->pid );
++    struct object *obj = get_ptid_entry( req->pid );
++    struct process *process;
++
+     reply->handle = 0;
++    if (obj && obj->ops == &unix_process_ops)
++    {
++        reply->handle = alloc_handle( current->process, obj, req->access, req->attributes );
++        return;
++    }
++    process = get_process_from_id( req->pid );
+     if (process)
+     {
+         reply->handle = alloc_handle( current->process, process, req->access, req->attributes );
+@@ -1459,6 +1612,27 @@
+ DECL_HANDLER(terminate_process)
+ {
+     struct process *process;
++    struct unix_process *unix_process;
++
++    if (req->handle && (unix_process = get_unix_process_from_handle( req->handle, PROCESS_TERMINATE )))
++    {
++        if (unix_process->exit_code == STILL_ACTIVE && !unix_process->terminated)
++        {
++#ifdef SYS_pidfd_send_signal
++            if (!syscall( SYS_pidfd_send_signal, get_unix_fd( unix_process->fd ), SIGKILL, NULL, 0 ))
++            {
++                unix_process->terminated = 1;
++                unix_process->exit_code = req->exit_code;
++            }
++            else if (errno != ESRCH) file_set_error();  /* ESRCH: it has just exited */
++#else
++            set_error( STATUS_NOT_SUPPORTED );
++#endif
++        }
++        release_object( unix_process );
++        return;
++    }
++    if (get_error()) return;
+ 
+     if (req->handle)
+     {
+@@ -1476,6 +1650,22 @@
+ DECL_HANDLER(get_process_info)
+ {
+     struct process *process;
++    struct unix_process *unix_process;
++
++    if ((unix_process = get_unix_process_from_handle( req->handle, PROCESS_QUERY_LIMITED_INFORMATION )))
++    {
++        reply->pid        = unix_process->id;
++        reply->ppid       = unix_process->parent_id;
++        reply->exit_code  = unix_process->exit_code;
++        reply->priority   = PROCESS_PRIOCLASS_NORMAL;
++        reply->start_time = unix_process->start_time;
++        reply->end_time   = unix_process->end_time;
++        reply->machine    = native_machine;
++        if (get_reply_max_size()) set_error( STATUS_NOT_SUPPORTED );  /* no PE image */
++        release_object( unix_process );
++        return;
++    }
++    if (get_error()) return;
+ 
+     if ((process = get_process_from_handle( req->handle, PROCESS_QUERY_LIMITED_INFORMATION )))
+     {
+@@ -2048,3 +2238,46 @@
+         }
+     }
+ }
++
++/* make a Unix program started by a Windows one waitable, like a process */
++DECL_HANDLER(new_unix_process)
++{
++    struct unix_process *process;
++    int pidfd;
++
++    if ((pidfd = thread_get_inflight_fd( current, req->pidfd )) == -1)
++    {
++        set_error( STATUS_INVALID_HANDLE );
++        return;
++    }
++    if (!(process = alloc_object( &unix_process_ops )))
++    {
++        close( pidfd );
++        return;
++    }
++    process->sync       = NULL;
++    process->fd         = NULL;
++    process->timeout    = NULL;
++    process->retry      = 0;
++    process->id         = 0;
++    process->parent_id  = current->process->id;
++    process->exit_code  = STILL_ACTIVE;
++    process->terminated = 0;
++    process->start_time = current_time;
++    process->end_time   = 0;
++
++    if (!(process->sync = create_internal_sync( 1, 0 )) || !(process->id = alloc_ptid( process )))
++    {
++        close( pidfd );
++        release_object( process );
++        return;
++    }
++    if ((process->fd = create_anonymous_fd( &unix_process_fd_ops, pidfd, &process->obj, 0 )))
++    {
++        set_fd_events( process->fd, POLLIN );
++        reply->pid = process->id;
++        if ((reply->handle = alloc_handle( current->process, process, req->access, req->attributes )))
++            reply->thread = alloc_handle( current->process, process, req->thread_access, req->attributes );
++    }
++    release_object( process );
++}
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1259,6 +1259,27 @@
+ @END
+ 
+ 
++/* Connect a pipe end to a Unix program's standard input or output */
++@REQ(set_pipe_unix_fd)
++    obj_handle_t handle;           /* pipe end */
++    int          fd;               /* our end of a Unix pipe, sent with wine_server_send_fd */
++    int          to_unix;          /* the program reads the pipe end */
++@END
++
++
++/* Make a Unix program started by a Windows one waitable, like a process */
++@REQ(new_unix_process)
++    int          pidfd;            /* pidfd of the program, sent with wine_server_send_fd */
++    unsigned int access;           /* wanted access rights to the process */
++    unsigned int thread_access;    /* wanted access rights for the thread handle */
++    unsigned int attributes;       /* object attributes */
++@REPLY
++    process_id_t pid;              /* server id of the process */
++    obj_handle_t handle;           /* process handle */
++    obj_handle_t thread;           /* handle standing in for its thread */
++@END
++
++
+ /* Retrieve debug information about a process */
+ @REQ(get_process_debug_info)
+     obj_handle_t handle;           /* process handle */
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -17,6 +17,8 @@
+ DECL_HANDLER(terminate_process);
+ DECL_HANDLER(terminate_thread);
+ DECL_HANDLER(get_process_info);
++DECL_HANDLER(set_pipe_unix_fd);
++DECL_HANDLER(new_unix_process);
+ DECL_HANDLER(get_process_debug_info);
+ DECL_HANDLER(get_process_image_name);
+ DECL_HANDLER(get_process_vm_counters);
+@@ -330,6 +332,8 @@
+     (req_handler)req_terminate_process,
+     (req_handler)req_terminate_thread,
+     (req_handler)req_get_process_info,
++    (req_handler)req_set_pipe_unix_fd,
++    (req_handler)req_new_unix_process,
+     (req_handler)req_get_process_debug_info,
+     (req_handler)req_get_process_image_name,
+     (req_handler)req_get_process_vm_counters,
+@@ -772,6 +776,19 @@
+ C_ASSERT( offsetof(struct get_process_info_reply, disable_boost) == 60 );
+ C_ASSERT( offsetof(struct get_process_info_reply, machine) == 62 );
+ C_ASSERT( sizeof(struct get_process_info_reply) == 64 );
++C_ASSERT( offsetof(struct set_pipe_unix_fd_request, handle) == 12 );
++C_ASSERT( offsetof(struct set_pipe_unix_fd_request, fd) == 16 );
++C_ASSERT( offsetof(struct set_pipe_unix_fd_request, to_unix) == 20 );
++C_ASSERT( sizeof(struct set_pipe_unix_fd_request) == 24 );
++C_ASSERT( offsetof(struct new_unix_process_request, pidfd) == 12 );
++C_ASSERT( offsetof(struct new_unix_process_request, access) == 16 );
++C_ASSERT( offsetof(struct new_unix_process_request, thread_access) == 20 );
++C_ASSERT( offsetof(struct new_unix_process_request, attributes) == 24 );
++C_ASSERT( sizeof(struct new_unix_process_request) == 32 );
++C_ASSERT( offsetof(struct new_unix_process_reply, pid) == 8 );
++C_ASSERT( offsetof(struct new_unix_process_reply, handle) == 12 );
++C_ASSERT( offsetof(struct new_unix_process_reply, thread) == 16 );
++C_ASSERT( sizeof(struct new_unix_process_reply) == 24 );
+ C_ASSERT( offsetof(struct get_process_debug_info_request, handle) == 12 );
+ C_ASSERT( sizeof(struct get_process_debug_info_request) == 16 );
+ C_ASSERT( offsetof(struct get_process_debug_info_reply, debug) == 8 );
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -216,6 +216,28 @@
+     dump_varargs_pe_image_info( ", image=", cur_size );
+ }
+ 
++static void dump_set_pipe_unix_fd_request( const struct set_pipe_unix_fd_request *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", fd=%d", req->fd );
++    fprintf( stderr, ", to_unix=%d", req->to_unix );
++}
++
++static void dump_new_unix_process_request( const struct new_unix_process_request *req )
++{
++    fprintf( stderr, " pidfd=%d", req->pidfd );
++    fprintf( stderr, ", access=%08x", req->access );
++    fprintf( stderr, ", thread_access=%08x", req->thread_access );
++    fprintf( stderr, ", attributes=%08x", req->attributes );
++}
++
++static void dump_new_unix_process_reply( const struct new_unix_process_reply *req )
++{
++    fprintf( stderr, " pid=%04x", req->pid );
++    fprintf( stderr, ", handle=%04x", req->handle );
++    fprintf( stderr, ", thread=%04x", req->thread );
++}
++
+ static void dump_get_process_debug_info_request( const struct get_process_debug_info_request *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
+@@ -3558,6 +3580,8 @@
+     (dump_func)dump_terminate_process_request,
+     (dump_func)dump_terminate_thread_request,
+     (dump_func)dump_get_process_info_request,
++    (dump_func)dump_set_pipe_unix_fd_request,
++    (dump_func)dump_new_unix_process_request,
+     (dump_func)dump_get_process_debug_info_request,
+     (dump_func)dump_get_process_image_name_request,
+     (dump_func)dump_get_process_vm_counters_request,
+@@ -3871,6 +3895,8 @@
+     (dump_func)dump_terminate_process_reply,
+     (dump_func)dump_terminate_thread_reply,
+     (dump_func)dump_get_process_info_reply,
++    NULL,
++    (dump_func)dump_new_unix_process_reply,
+     (dump_func)dump_get_process_debug_info_reply,
+     (dump_func)dump_get_process_image_name_reply,
+     (dump_func)dump_get_process_vm_counters_reply,
+@@ -4184,6 +4210,8 @@
+     "terminate_process",
+     "terminate_thread",
+     "get_process_info",
++    "set_pipe_unix_fd",
++    "new_unix_process",
+     "get_process_debug_info",
+     "get_process_image_name",
+     "get_process_vm_counters",

@@ -1,0 +1,15 @@
+[Unit]
+Description=Keep the 10x Wine prefix booted so 10x opens instantly
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/usr/bin/10x --prewarm
+ExecStop=/usr/bin/10x --stop
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

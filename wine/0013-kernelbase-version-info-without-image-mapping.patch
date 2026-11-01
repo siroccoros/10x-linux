@@ -1,0 +1,24 @@
+--- a/dlls/kernelbase/version.c
++++ b/dlls/kernelbase/version.c
+@@ -772,7 +772,10 @@
+     if (flags & ~FILE_VER_GET_LOCALISED)
+         FIXME("flags 0x%lx ignored\n", flags & ~FILE_VER_GET_LOCALISED);
+ 
+-    if ((hModule = LoadLibraryExW( filename, 0, LOAD_LIBRARY_AS_IMAGE_RESOURCE )))
++    /* As a data file: mapping an image whose sections aren't page aligned
++     * reads all of it, and some programs query big DLLs often (.NET's shim
++     * queries clr.dll at every thread start and exit). */
++    if ((hModule = LoadLibraryExW( filename, 0, LOAD_LIBRARY_AS_DATAFILE )))
+     {
+         HRSRC hRsrc = NULL;
+         if (!(flags & FILE_VER_GET_LOCALISED))
+@@ -877,7 +880,8 @@
+     if (flags & ~FILE_VER_GET_LOCALISED)
+         FIXME("flags 0x%lx ignored\n", flags & ~FILE_VER_GET_LOCALISED);
+ 
+-    if ((hModule = LoadLibraryExW( filename, 0, LOAD_LIBRARY_AS_IMAGE_RESOURCE )))
++    /* As a data file, see GetFileVersionInfoSizeExW. */
++    if ((hModule = LoadLibraryExW( filename, 0, LOAD_LIBRARY_AS_DATAFILE )))
+     {
+         HRSRC hRsrc = NULL;
+         if (!(flags & FILE_VER_GET_LOCALISED))

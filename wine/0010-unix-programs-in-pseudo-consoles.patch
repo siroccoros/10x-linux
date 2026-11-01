@@ -1,0 +1,624 @@
+--- a/include/wine/condrv.h
++++ b/include/wine/condrv.h
+@@ -46,6 +46,7 @@
+ #define IOCTL_CONDRV_GET_PROCESS_LIST      CTL_CODE(FILE_DEVICE_CONSOLE, 23, METHOD_BUFFERED, FILE_ANY_ACCESS)
+ #define IOCTL_CONDRV_READ_CONSOLE_CONTROL  CTL_CODE(FILE_DEVICE_CONSOLE, 24, METHOD_BUFFERED, FILE_READ_ACCESS)
+ #define IOCTL_CONDRV_GET_INPUT_COUNT       CTL_CODE(FILE_DEVICE_CONSOLE, 25, METHOD_BUFFERED, FILE_READ_ACCESS)
++#define IOCTL_CONDRV_ATTACH_PTY            CTL_CODE(FILE_DEVICE_CONSOLE, 26, METHOD_BUFFERED, FILE_ANY_ACCESS)
+ 
+ /* console output ioctls */
+ #define IOCTL_CONDRV_WRITE_CONSOLE         CTL_CODE(FILE_DEVICE_CONSOLE, 30, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+@@ -63,6 +64,8 @@
+ 
+ /* console server ioctls */
+ #define IOCTL_CONDRV_SETUP_INPUT           CTL_CODE(FILE_DEVICE_CONSOLE, 60, METHOD_BUFFERED, FILE_ANY_ACCESS)
++#define IOCTL_CONDRV_BRIDGE_PTY            CTL_CODE(FILE_DEVICE_CONSOLE, 61, METHOD_BUFFERED, FILE_ANY_ACCESS)
++#define IOCTL_CONDRV_RESIZE_PTY            CTL_CODE(FILE_DEVICE_CONSOLE, 62, METHOD_BUFFERED, FILE_ANY_ACCESS)
+ 
+ /* ioctls used for communication between driver and host */
+ #define IOCTL_CONDRV_INIT_OUTPUT           CTL_CODE(FILE_DEVICE_CONSOLE, 90, METHOD_BUFFERED, 0)
+@@ -198,6 +201,26 @@
+     unsigned int group_id;      /* the group to send the event to */
+ };
+ 
++/* IOCTL_CONDRV_BRIDGE_PTY params: the pseudo console's pipes to connect to
++ * the pseudo terminal given with IOCTL_CONDRV_ATTACH_PTY, or no pipes to drop it */
++struct condrv_pty_bridge
++{
++    unsigned int input;         /* pipe the terminal writes the input to */
++    unsigned int output;        /* pipe the terminal reads the output from */
++    unsigned short width;       /* size in characters */
++    unsigned short height;
++};
++
++/* IOCTL_CONDRV_RESIZE_PTY params */
++struct condrv_pty_size
++{
++    unsigned short width;
++    unsigned short height;
++};
++
++/* pseudo console signals, written to its signal pipe as an unsigned short, as on Windows */
++#define PTY_SIGNAL_RESIZE_WINDOW  8   /* followed by the width and height, as unsigned shorts */
++
+ /* Wine specific values for console inheritance (params->ConsoleHandle) */
+ #define CONSOLE_HANDLE_ALLOC            LongToHandle(-1)
+ #define CONSOLE_HANDLE_ALLOC_NO_WINDOW  LongToHandle(-2)
+--- a/server/file.h
++++ b/server/file.h
+@@ -211,6 +211,8 @@
+ 
+ extern struct object *create_named_pipe_device( struct object *root, struct unicode_str name,
+                                                 unsigned int attr, const struct security_descriptor *sd );
++extern struct object *create_pipe_bridge( struct process *process, obj_handle_t handle, int unix_fd, int to_unix );
++extern void close_pipe_bridge( struct object *bridge );
+ extern struct object *create_mailslot_device( struct object *root, struct unicode_str name,
+                                               unsigned int attr, const struct security_descriptor *sd );
+ extern struct object *create_console_device( struct object *root, struct unicode_str name,
+--- a/server/named_pipe.c
++++ b/server/named_pipe.c
+@@ -1173,11 +1173,17 @@
+ {
+     struct pipe_bridge *bridge, *next;
+     struct async *async;
++    int bridged = 0;
+ 
+     ignore_reselect = 1;
+     LIST_FOR_EACH_ENTRY_SAFE( bridge, next, &pipe_end->bridges, struct pipe_bridge, entry )
+-        if (bridge->to_unix && pipe_bridge_write( bridge )) reselect_write = 1;
+-    while (!list_empty( &pipe_end->message_queue ) && (async = find_pending_async( &pipe_end->read_q )))
++    {
++        if (!bridge->to_unix) continue;
++        if (pipe_bridge_write( bridge )) reselect_write = 1;
++        if (bridge->pipe_end && !bridge->closing) bridged = 1;
++    }
++    /* while a Unix program reads the pipe end, it is the only reader */
++    while (!bridged && !list_empty( &pipe_end->message_queue ) && (async = find_pending_async( &pipe_end->read_q )))
+     {
+         message_queue_read( pipe_end, async );
+         release_object( async );
+@@ -1848,32 +1854,26 @@
+     release_object( pipe_end );
+ }
+ 
+-/* connect a pipe end to a Unix program's standard input or output */
+-DECL_HANDLER(set_pipe_unix_fd)
++/* connect a pipe end to a Unix file descriptor, taking ownership of it; returns
++ * a reference to the bridge, for close_pipe_bridge */
++struct object *create_pipe_bridge( struct process *process, obj_handle_t handle, int unix_fd, int to_unix )
+ {
+     struct pipe_bridge *bridge;
+     struct pipe_end *pipe_end;
+     struct object *obj;
+-    int unix_fd;
+ 
+-    if ((unix_fd = thread_get_inflight_fd( current, req->fd )) == -1)
+-    {
+-        set_error( STATUS_INVALID_HANDLE );
+-        return;
+-    }
+     fcntl( unix_fd, F_SETFL, fcntl( unix_fd, F_GETFL ) | O_NONBLOCK );
+-    if (!(obj = get_handle_obj( current->process, req->handle,
+-                                req->to_unix ? FILE_READ_DATA : FILE_WRITE_DATA, NULL )))
++    if (!(obj = get_handle_obj( process, handle, to_unix ? FILE_READ_DATA : FILE_WRITE_DATA, NULL )))
+     {
+         close( unix_fd );
+-        return;
++        return NULL;
+     }
+     if (obj->ops != &pipe_server_ops && obj->ops != &pipe_client_ops)
+     {
+         set_error( STATUS_OBJECT_TYPE_MISMATCH );
+         close( unix_fd );
+         release_object( obj );
+-        return;
++        return NULL;
+     }
+     pipe_end = (struct pipe_end *)obj;
+ 
+@@ -1881,20 +1881,47 @@
+     {
+         close( unix_fd );
+         release_object( obj );
+-        return;
++        return NULL;
+     }
+     bridge->pipe_end = NULL;
+-    bridge->to_unix  = req->to_unix;
++    bridge->to_unix  = to_unix;
+     bridge->closing  = NULL;
+     if (!(bridge->fd = create_anonymous_fd( &pipe_bridge_fd_ops, unix_fd, &bridge->obj, 0 )))
+     {
+         release_object( bridge );
+         release_object( obj );
+-        return;
++        return NULL;
+     }
+     bridge->pipe_end = pipe_end;  /* holds the reference from get_handle_obj; the pipe end holds the bridge's */
+     list_add_tail( &pipe_end->bridges, &bridge->entry );
+ 
++    grab_object( bridge );
+     if (bridge->to_unix) reselect_read_queue( pipe_end, 0 );
+     else pipe_bridge_update( bridge );
++    return &bridge->obj;
++}
++
++/* disconnect a bridge from create_pipe_bridge and release the reference to it */
++void close_pipe_bridge( struct object *obj )
++{
++    struct pipe_bridge *bridge = (struct pipe_bridge *)obj;
++
++    assert( obj->ops == &pipe_bridge_ops );
++    pipe_bridge_finish( bridge );
++    release_object( bridge );
++}
++
++/* connect a pipe end to a Unix program's standard input or output */
++DECL_HANDLER(set_pipe_unix_fd)
++{
++    struct object *bridge;
++    int unix_fd;
++
++    if ((unix_fd = thread_get_inflight_fd( current, req->fd )) == -1)
++    {
++        set_error( STATUS_INVALID_HANDLE );
++        return;
++    }
++    if ((bridge = create_pipe_bridge( current->process, req->handle, unix_fd, req->to_unix )))
++        release_object( bridge );
+ }
+--- a/server/console.c
++++ b/server/console.c
+@@ -124,6 +124,8 @@
+     unsigned int          once_input : 1; /* flag if input thread has already been requested */
+     int                   term_fd;        /* UNIX terminal fd */
+     struct termios        termios;        /* original termios */
++    int                   pty_fd;         /* master of the pseudo terminal of a Unix program */
++    struct object        *pty_bridge[2];  /* the pseudo console's pipes connected to it */
+ };
+ 
+ static void console_server_dump( struct object *obj, int verbose );
+@@ -456,6 +458,27 @@
+     return 1;
+ }
+ 
++static void close_console_pty( struct console_server *server )
++{
++    int i;
++
++    for (i = 0; i < 2; i++)
++    {
++        if (server->pty_bridge[i]) close_pipe_bridge( server->pty_bridge[i] );
++        server->pty_bridge[i] = NULL;
++    }
++    if (server->pty_fd != -1) close( server->pty_fd );
++    server->pty_fd = -1;
++}
++
++/* the program gets SIGWINCH */
++static int set_console_pty_size( struct console_server *server, unsigned short width, unsigned short height )
++{
++    struct winsize size = { .ws_row = height, .ws_col = width };
++
++    return ioctl( server->pty_fd, TIOCSWINSZ, &size );
++}
++
+ static void disconnect_console_server( struct console_server *server )
+ {
+     while (!list_empty( &server->queue ))
+@@ -478,6 +501,8 @@
+         server->term_fd = -1;
+     }
+ 
++    close_console_pty( server );  /* the pseudo terminal hangs up, as a terminal closing does */
++
+     if (server->console)
+     {
+         assert( server->console->server == server );
+@@ -836,6 +861,8 @@
+     server->busy       = 0;
+     server->once_input = 0;
+     server->term_fd    = -1;
++    server->pty_fd     = -1;
++    server->pty_bridge[0] = server->pty_bridge[1] = NULL;
+     list_init( &server->queue );
+     list_init( &server->read_queue );
+ 
+@@ -915,6 +942,43 @@
+             return;
+         }
+ 
++    case IOCTL_CONDRV_ATTACH_PTY:
++        {
++            /* a Unix program uses this pseudo terminal in the console: keep its
++             * master and let the host connect it, see IOCTL_CONDRV_BRIDGE_PTY */
++            struct file *file;
++            int unix_fd;
++
++            if (get_req_data_size() != sizeof(unsigned int) || get_reply_max_size())
++            {
++                set_error( STATUS_INVALID_PARAMETER );
++                return;
++            }
++            if (!console->server)
++            {
++                set_error( STATUS_INVALID_HANDLE );
++                return;
++            }
++            if (console->server->pty_fd != -1)
++            {
++                set_error( STATUS_DEVICE_BUSY );
++                return;
++            }
++            if (!(file = get_file_obj( current->process, *(unsigned int *)get_req_data(),
++                                       FILE_READ_DATA | FILE_WRITE_DATA )))
++                return;
++            unix_fd = get_file_unix_fd( file );
++            release_object( file );
++            if (unix_fd == -1) return;
++            if ((console->server->pty_fd = dup( unix_fd )) == -1)
++            {
++                file_set_error();
++                return;
++            }
++            queue_host_ioctl( console->server, code, 0, async, &console->ioctl_q );
++            return;
++        }
++
+     default:
+         if (!console->server || code >> 16 != FILE_DEVICE_CONSOLE)
+         {
+@@ -1095,6 +1159,61 @@
+             return;
+         }
+ 
++    case IOCTL_CONDRV_BRIDGE_PTY:
++        {
++            const struct condrv_pty_bridge *bridge = get_req_data();
++            int fd[2];
++
++            if (get_req_data_size() != sizeof(*bridge) || get_reply_max_size())
++            {
++                set_error( STATUS_INVALID_PARAMETER );
++                return;
++            }
++            if (server->pty_fd == -1 || server->pty_bridge[0])
++            {
++                set_error( STATUS_INVALID_HANDLE );
++                return;
++            }
++            if (!bridge->input && !bridge->output)
++            {
++                close_console_pty( server );  /* the host can't use it */
++                return;
++            }
++            if ((fd[0] = dup( server->pty_fd )) == -1 || (fd[1] = dup( server->pty_fd )) == -1)
++            {
++                file_set_error();
++                if (fd[0] != -1) close( fd[0] );
++                close_console_pty( server );
++                return;
++            }
++            set_console_pty_size( server, bridge->width, bridge->height );
++            if (!(server->pty_bridge[0] = create_pipe_bridge( current->process, bridge->input, fd[0], 1 )) ||
++                !(server->pty_bridge[1] = create_pipe_bridge( current->process, bridge->output, fd[1], 0 )))
++            {
++                if (!server->pty_bridge[0]) close( fd[1] );
++                close_console_pty( server );
++            }
++            return;
++        }
++
++    case IOCTL_CONDRV_RESIZE_PTY:
++        {
++            const struct condrv_pty_size *size = get_req_data();
++
++            if (get_req_data_size() != sizeof(*size) || get_reply_max_size())
++            {
++                set_error( STATUS_INVALID_PARAMETER );
++                return;
++            }
++            if (server->pty_fd == -1)
++            {
++                set_error( STATUS_INVALID_HANDLE );
++                return;
++            }
++            if (set_console_pty_size( server, size->width, size->height )) file_set_error();
++            return;
++        }
++
+     default:
+         set_error( STATUS_INVALID_HANDLE );
+         return;
+--- a/programs/conhost/conhost.h
++++ b/programs/conhost/conhost.h
+@@ -79,6 +79,7 @@
+     int                    is_unix;             /* UNIX terminal mode */
+     int                    use_relative_cursor; /* use relative cursor positioning */
+     int                    no_window;           /* don't create console window */
++    int                    pty;                 /* a Unix program's pseudo terminal has the tty streams */
+     INPUT_RECORD          *records;             /* input records */
+     unsigned int           record_count;        /* number of input records */
+     unsigned int           record_size;         /* size of input records buffer */
+--- a/programs/conhost/conhost.c
++++ b/programs/conhost/conhost.c
+@@ -2665,6 +2665,77 @@
+     }
+ }
+ 
++/* A Unix program started in a pseudo console has a pseudo terminal, which
++ * the server connects to the terminal's pipes as a Unix terminal would be:
++ * the terminal then shows its output and sends it its input, without us. */
++static NTSTATUS attach_pty( struct console *console )
++{
++    struct condrv_pty_bridge bridge = { 0 };
++    IO_STATUS_BLOCK io;
++    NTSTATUS status;
++
++    if (!console->pty && !console->is_unix && console->tty_input && console->tty_output)
++    {
++        tty_flush( console );
++        bridge.input  = condrv_handle( console->tty_input );
++        bridge.output = condrv_handle( console->tty_output );
++        bridge.width  = console->active->win.right - console->active->win.left + 1;
++        bridge.height = console->active->win.bottom - console->active->win.top + 1;
++    }
++    status = NtDeviceIoControlFile( console->server, NULL, NULL, NULL, &io, IOCTL_CONDRV_BRIDGE_PTY,
++                                    &bridge, sizeof(bridge), NULL, 0 );
++    if (!bridge.input) return STATUS_NOT_SUPPORTED;
++    if (status)
++    {
++        ERR( "pty bridge failed: %#lx\n", status );
++        return status;
++    }
++    TRACE( "the pty has the tty streams\n" );
++    console->pty = 1;
++    console->tty_output = NULL;
++    return STATUS_SUCCESS;
++}
++
++/* the terminal of a pseudo console was resized */
++static void resize_pseudo_console( struct console *console, unsigned int width, unsigned int height )
++{
++    struct screen_buffer *screen_buffer = console->active;
++    IO_STATUS_BLOCK io;
++    unsigned int scroll;
++    RECT update_rect;
++
++    TRACE( "%ux%u\n", width, height );
++    if (!width || !height) return;
++
++    if (console->pty)
++    {
++        struct condrv_pty_size size = { width, height };
++        NtDeviceIoControlFile( console->server, NULL, NULL, NULL, &io, IOCTL_CONDRV_RESIZE_PTY,
++                               &size, sizeof(size), NULL, 0 );
++        return;
++    }
++
++    /* keep the cursor's line, as the terminal does */
++    if (screen_buffer->cursor_y >= height)
++    {
++        scroll = screen_buffer->cursor_y - height + 1;
++        memmove( screen_buffer->data, screen_buffer->data + scroll * screen_buffer->width,
++                 (screen_buffer->height - scroll) * screen_buffer->width * sizeof(*screen_buffer->data) );
++        screen_buffer->cursor_y -= scroll;
++    }
++    if (change_screen_buffer_size( screen_buffer, width, height )) return;
++    SetRect( &screen_buffer->win, 0, 0, width - 1, height - 1 );
++    if (screen_buffer->cursor_x >= width) screen_buffer->cursor_x = width - 1;
++    notify_screen_buffer_size( screen_buffer );
++
++    if (!console->tty_output) return;
++    tty_write( console, "\x1b[2J\x1b[H", 7 );
++    console->tty_cursor_x = console->tty_cursor_y = 0;
++    SetRect( &update_rect, 0, 0, width - 1, height - 1 );
++    update_output( screen_buffer, &update_rect );
++    tty_sync( console );
++}
++
+ static NTSTATUS console_input_ioctl( struct console *console, unsigned int code, const void *in_data,
+                                      size_t in_size, size_t *out_size )
+ {
+@@ -2863,6 +2934,10 @@
+         console->record_count = 0;
+         return STATUS_SUCCESS;
+ 
++    case IOCTL_CONDRV_ATTACH_PTY:
++        if (*out_size) return STATUS_INVALID_PARAMETER;
++        return attach_pty( console );
++
+     default:
+         WARN( "unsupported ioctl %x\n", code );
+         return STATUS_INVALID_HANDLE;
+@@ -3007,7 +3082,23 @@
+                 TRACE( "signaled quit\n" );
+                 return 0;
+             }
+-            FIXME( "unimplemented signal %x\n", signal_id );
++            if (signal_id == PTY_SIGNAL_RESIZE_WINDOW)
++            {
++                unsigned short size[2];
++
++                status = NtReadFile( signal, signal_event, NULL, NULL, &signal_io, size, sizeof(size), NULL, NULL );
++                if (status == STATUS_PENDING && !(status = NtWaitForSingleObject( signal_event, FALSE, NULL )))
++                    status = signal_io.Status;
++                if (status || signal_io.Information != sizeof(size))
++                {
++                    TRACE( "signaled quit\n" );
++                    return 0;
++                }
++                EnterCriticalSection( &console_section );
++                resize_pseudo_console( console, size[0], size[1] );
++                LeaveCriticalSection( &console_section );
++            }
++            else FIXME( "unimplemented signal %x\n", signal_id );
+             status = NtReadFile( signal, signal_event, NULL, NULL, &signal_io, &signal_id,
+                                  sizeof(signal_id), NULL, NULL );
+             if (status && status != STATUS_PENDING) return 1;
+--- a/dlls/kernelbase/console.c
++++ b/dlls/kernelbase/console.c
+@@ -2345,7 +2345,15 @@
+  */
+ HRESULT WINAPI ResizePseudoConsole( HPCON handle, COORD size )
+ {
+-    FIXME( "%p (%u,%u) stub, faking success\n", handle, size.X, size.Y );
++    struct pseudo_console *pseudo_console = handle;
++    unsigned short signal[3] = { PTY_SIGNAL_RESIZE_WINDOW, size.X, size.Y };
++    DWORD written;
++
++    TRACE( "%p (%u,%u)\n", handle, size.X, size.Y );
++
++    if (!pseudo_console || size.X <= 0 || size.Y <= 0) return E_INVALIDARG;
++    if (!WriteFile( pseudo_console->signal, signal, sizeof(signal), &written, NULL ))
++        return HRESULT_FROM_WIN32( GetLastError() );
+     return S_OK;
+ }
+ 
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -41,6 +41,7 @@
+ #include <sys/types.h>
+ #include <sys/wait.h>
+ #ifdef __linux__
++# include <sys/ioctl.h>
+ # include <sys/syscall.h>
+ #endif
+ #ifdef __linux__
+@@ -766,6 +767,53 @@
+ 
+ 
+ /***********************************************************************
++ *           open_console_pty
++ *
++ * A Unix program started in a pseudo console gets a pseudo terminal, as a
++ * Unix terminal gives the programs it runs; the console's host connects the
++ * terminal to it. Returns its slave, or -1 if the console has no use for one.
++ */
++static int open_console_pty( HANDLE console )
++{
++#ifdef __linux__
++    int master, slave = -1;
++    unsigned int h;
++    HANDLE handle;
++    char name[64];
++
++    if (!console || console == CONSOLE_HANDLE_ALLOC || console == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
++        console == CONSOLE_HANDLE_SHELL || console == CONSOLE_HANDLE_SHELL_NO_WINDOW)
++        return -1;
++
++    if ((master = posix_openpt( O_RDWR | O_NOCTTY | O_CLOEXEC )) == -1) return -1;
++    if (!grantpt( master ) && !unlockpt( master ) && !ptsname_r( master, name, sizeof(name) ) &&
++        (slave = open( name, O_RDWR | O_NOCTTY | O_CLOEXEC )) != -1)
++    {
++        if (!wine_server_fd_to_handle( master, GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, 0, &handle ))
++        {
++            h = wine_server_obj_handle( handle );
++            if (sync_ioctl( console, IOCTL_CONDRV_ATTACH_PTY, &h, sizeof(h), NULL, 0 ))
++            {
++                close( slave );
++                slave = -1;
++            }
++            NtClose( handle );
++        }
++        else
++        {
++            close( slave );
++            slave = -1;
++        }
++    }
++    close( master );
++    return slave;
++#else
++    return -1;
++#endif
++}
++
++
++/***********************************************************************
+  *           fork_and_exec
+  *
+  * Fork and exec a new Unix binary, checking for errors. Returns a pidfd for it,
+@@ -775,8 +823,8 @@
+                                const RTL_USER_PROCESS_PARAMETERS *params, int *pidfd )
+ {
+     pid_t pid, grandchild;
+-    int fd[2], pidpipe[2], ack[2], stdio_fd[3], i;
+-    char **argv;
++    int fd[2], pidpipe[2], ack[2], stdio_fd[3], pty = -1, i;
++    char **argv, **envp = NULL;
+     char c;
+     BOOL use_std_handles = (params->dwFlags & STARTF_USESTDHANDLES) != 0;
+     NTSTATUS status = STATUS_SUCCESS;
+@@ -817,6 +865,24 @@
+             stdio_fd[1] = 1;
+     }
+ 
++    /* in a pseudo console, the streams it wasn't given are its pseudo terminal */
++    if (stdio_fd[0] == -1 || stdio_fd[1] == -1 || stdio_fd[2] == -1 || !use_std_handles)
++        pty = open_console_pty( params->ConsoleHandle );
++    if (pty != -1)
++    {
++        if (!use_std_handles &&
++            wine_server_handle_to_fd( params->hStdError, FILE_WRITE_DATA, &stdio_fd[2], NULL ))
++            stdio_fd[2] = -1;
++        for (i = 0; i < 3; i++) if (stdio_fd[i] == -1) stdio_fd[i] = pty;
++#ifdef __linux__
++        {
++            static char term[] = "TERM=xterm-256color";  /* what the console's terminal is */
++            char *vars[] = { term };
++            envp = build_loader_env( vars, ARRAY_SIZE(vars) );
++        }
++#endif
++    }
++
+     if (!(pid = fork()))  /* child */
+     {
+         close( ack[1] );
+@@ -824,7 +890,12 @@
+         {
+             close( fd[0] );
+ 
+-            if (needs_new_session( params ))
++            if (pty != -1)
++            {
++                setsid();
++                ioctl( pty, TIOCSCTTY, 0 );  /* its controlling terminal */
++            }
++            else if (needs_new_session( params ))
+             {
+                 setsid();
+                 if (!use_std_handles) stdio_fd[0] = stdio_fd[1] = -1;  /* close stdin and stdout */
+@@ -838,7 +909,9 @@
+             if (stdio_fd[2] != 2) dup2( stdio_fd[2], 2 );
+ 
+             for (i = 0; i < 3; i++)
+-                if (stdio_fd[i] > 2 && (i < 2 || stdio_fd[2] != stdio_fd[1])) close( stdio_fd[i] );
++                if (stdio_fd[i] > 2 && stdio_fd[i] != pty && (i < 2 || stdio_fd[2] != stdio_fd[1]))
++                    close( stdio_fd[i] );
++            if (pty > 2) close( pty );
+ 
+             /* Reset signals that we previously set to SIG_IGN */
+             signal( SIGPIPE, SIG_DFL );
+@@ -849,7 +922,8 @@
+                 fchdir( unixdir );
+                 close( unixdir );
+             }
+-            execv( unix_name, argv );
++            if (envp) execve( unix_name, argv, envp );
++            else execv( unix_name, argv );
+         }
+ 
+         if (pid <= 0)  /* grandchild if exec failed or child if fork failed */
+@@ -903,7 +977,10 @@
+     close( fd[0] );
+     close( pidpipe[0] );
+     for (i = 0; i < 3; i++)
+-        if (stdio_fd[i] > 2 && (i < 2 || stdio_fd[2] != stdio_fd[1])) close( stdio_fd[i] );
++        if (stdio_fd[i] > 2 && stdio_fd[i] != pty && (i < 2 || stdio_fd[2] != stdio_fd[1]))
++            close( stdio_fd[i] );
++    if (pty != -1) close( pty );
++    free( envp );
+     if (status && *pidfd != -1)
+     {
+         close( *pidfd );

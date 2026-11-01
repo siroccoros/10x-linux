@@ -1,0 +1,1062 @@
+--- a/dlls/comdlg32/Makefile.in
++++ b/dlls/comdlg32/Makefile.in
+@@ -1,8 +1,10 @@
+ EXTRADEFS = -D_COMDLG32_
+ MODULE    = comdlg32.dll
++UNIXLIB   = comdlg32.so
+ IMPORTLIB = comdlg32
+ IMPORTS   = uuid shell32 shlwapi comctl32 user32 gdi32 advapi32
+ DELAYIMPORTS = ole32 winspool
++UNIX_CFLAGS  = $(DBUS_CFLAGS)
+ 
+ VER_FILEDESCRIPTION_STR = "Common Dialog Boxes"
+ VER_PRODUCTVERSION      = 6,0,2900,5512
+@@ -22,4 +24,5 @@
+ 	pd32_landscape.svg \
+ 	pd32_nocollate.svg \
+ 	pd32_portrait.svg \
++	portal.c \
+ 	printdlg.c
+--- a/dlls/comdlg32/cdlg.h
++++ b/dlls/comdlg32/cdlg.h
+@@ -156,6 +156,7 @@
+ #define IDS_OPEN_FILE    1205
+ #define IDS_SELECT_FOLDER 1206
+ #define IDS_FONT_SIZE_INPUT 1207
++#define IDS_OPEN         1208
+ 
+ #define IDS_FAKEDOCTEXT  1300
+ 
+--- a/dlls/comdlg32/comdlg32.rc
++++ b/dlls/comdlg32/comdlg32.rc
+@@ -145,6 +145,7 @@
+     IDS_SAVE_AS     "Save As"
+     IDS_OPEN_FILE   "Open File"
+     IDS_SELECT_FOLDER "Select Folder"
++    IDS_OPEN        "Open"
+     IDS_FONT_SIZE_INPUT "Font size has to be a number."
+ }
+ 
+--- a/dlls/comdlg32/unixlib.h
++++ b/dlls/comdlg32/unixlib.h
+@@ -0,0 +1,62 @@
++/*
++ * The desktop portal's file chooser, for the item dialog
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "wine/unixlib.h"
++
++#define PORTAL_SAVE      0x1
++#define PORTAL_MULTIPLE  0x2
++#define PORTAL_DIRECTORY 0x4
++
++struct portal_open_params
++{
++    UINT32 flags;
++    const char *parent;        /* "wayland:<handle>" or "" */
++    const char *title;
++    const char *accept_label;  /* NULL for the default */
++    const char *folder;        /* Unix path, or NULL */
++    const char *name;          /* proposed file name (save), or NULL */
++    UINT32 filter_count;
++    const char *filters;       /* filter_count pairs of strings: name, then Windows patterns ("*.c;*.h") */
++    UINT32 current_filter;     /* index into filters, or ~0u */
++    UINT64 request;            /* out */
++};
++
++struct portal_request_params
++{
++    UINT64 request;
++};
++
++struct portal_result_params
++{
++    UINT64 request;
++    char *buffer;              /* chosen Unix paths, each null-terminated */
++    UINT32 size;
++    UINT32 needed;             /* out */
++    UINT32 response;           /* out: 0 chosen, 1 cancelled, 2 other */
++    UINT32 filter;             /* out: index of the chosen filter, or ~0u */
++};
++
++enum portal_funcs
++{
++    unix_portal_open,
++    unix_portal_wait,
++    unix_portal_cancel,
++    unix_portal_result,
++    unix_portal_close,
++    unix_portal_funcs_count,
++};
+--- a/dlls/comdlg32/portal.c
++++ b/dlls/comdlg32/portal.c
+@@ -0,0 +1,585 @@
++/*
++ * The desktop portal's file chooser, for the item dialog
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <ctype.h>
++#include <dlfcn.h>
++#include <pthread.h>
++#include <unistd.h>
++#ifdef SONAME_LIBDBUS_1
++# include <dbus/dbus.h>
++#endif
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winternl.h"
++#include "unixlib.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(commdlg);
++
++#ifdef SONAME_LIBDBUS_1
++
++#define DBUS_FUNCS \
++    DO_FUNC(dbus_bus_add_match); \
++    DO_FUNC(dbus_bus_get_private); \
++    DO_FUNC(dbus_bus_get_unique_name); \
++    DO_FUNC(dbus_connection_close); \
++    DO_FUNC(dbus_connection_flush); \
++    DO_FUNC(dbus_connection_pop_message); \
++    DO_FUNC(dbus_connection_read_write); \
++    DO_FUNC(dbus_connection_send); \
++    DO_FUNC(dbus_connection_send_with_reply_and_block); \
++    DO_FUNC(dbus_connection_set_exit_on_disconnect); \
++    DO_FUNC(dbus_connection_unref); \
++    DO_FUNC(dbus_error_free); \
++    DO_FUNC(dbus_error_init); \
++    DO_FUNC(dbus_error_is_set); \
++    DO_FUNC(dbus_message_get_path); \
++    DO_FUNC(dbus_message_is_signal); \
++    DO_FUNC(dbus_message_iter_append_basic); \
++    DO_FUNC(dbus_message_iter_close_container); \
++    DO_FUNC(dbus_message_iter_get_arg_type); \
++    DO_FUNC(dbus_message_iter_get_basic); \
++    DO_FUNC(dbus_message_iter_init); \
++    DO_FUNC(dbus_message_iter_init_append); \
++    DO_FUNC(dbus_message_iter_next); \
++    DO_FUNC(dbus_message_iter_open_container); \
++    DO_FUNC(dbus_message_iter_recurse); \
++    DO_FUNC(dbus_message_new_method_call); \
++    DO_FUNC(dbus_message_unref); \
++    DO_FUNC(dbus_threads_init_default)
++
++#define DO_FUNC(f) static typeof(f) * p_##f
++DBUS_FUNCS;
++#undef DO_FUNC
++
++static BOOL dbus_loaded;
++
++static void load_dbus_once(void)
++{
++    void *handle;
++
++    if (!(handle = dlopen( SONAME_LIBDBUS_1, RTLD_NOW ))) goto failed;
++#define DO_FUNC(f) if (!(p_##f = dlsym( handle, #f ))) goto failed
++    DBUS_FUNCS;
++#undef DO_FUNC
++    p_dbus_threads_init_default();
++    dbus_loaded = TRUE;
++    return;
++failed:
++    WARN( "failed to load DBus support: %s\n", dlerror() );
++}
++
++static BOOL load_dbus(void)
++{
++    static pthread_once_t once = PTHREAD_ONCE_INIT;
++
++    pthread_once( &once, load_dbus_once );
++    return dbus_loaded;
++}
++
++struct request
++{
++    DBusConnection *connection;
++    char *path;                 /* the portal's Request object */
++    volatile LONG cancelled;
++    BOOL done;
++    UINT32 response;
++    char *paths;                /* chosen Unix paths, each null-terminated */
++    size_t paths_size;
++    char *filter;               /* name of the chosen filter */
++    char **filter_names;
++    UINT32 filter_count;
++};
++
++static void free_request( struct request *req )
++{
++    UINT32 i;
++
++    if (req->connection)
++    {
++        p_dbus_connection_close( req->connection );
++        p_dbus_connection_unref( req->connection );
++    }
++    for (i = 0; i < req->filter_count; i++) free( req->filter_names[i] );
++    free( req->filter_names );
++    free( req->path );
++    free( req->paths );
++    free( req->filter );
++    free( req );
++}
++
++/* a{sv} entry helpers */
++
++static void open_entry( DBusMessageIter *dict, DBusMessageIter *entry, DBusMessageIter *variant,
++                        const char *key, const char *signature )
++{
++    p_dbus_message_iter_open_container( dict, DBUS_TYPE_DICT_ENTRY, NULL, entry );
++    p_dbus_message_iter_append_basic( entry, DBUS_TYPE_STRING, &key );
++    p_dbus_message_iter_open_container( entry, DBUS_TYPE_VARIANT, signature, variant );
++}
++
++static void close_entry( DBusMessageIter *dict, DBusMessageIter *entry, DBusMessageIter *variant )
++{
++    p_dbus_message_iter_close_container( entry, variant );
++    p_dbus_message_iter_close_container( dict, entry );
++}
++
++static void append_string_entry( DBusMessageIter *dict, const char *key, const char *value )
++{
++    DBusMessageIter entry, variant;
++
++    open_entry( dict, &entry, &variant, key, "s" );
++    p_dbus_message_iter_append_basic( &variant, DBUS_TYPE_STRING, &value );
++    close_entry( dict, &entry, &variant );
++}
++
++static void append_bool_entry( DBusMessageIter *dict, const char *key, BOOL value )
++{
++    DBusMessageIter entry, variant;
++    dbus_bool_t b = !!value;
++
++    open_entry( dict, &entry, &variant, key, "b" );
++    p_dbus_message_iter_append_basic( &variant, DBUS_TYPE_BOOLEAN, &b );
++    close_entry( dict, &entry, &variant );
++}
++
++static void append_bytes_entry( DBusMessageIter *dict, const char *key, const char *value )
++{
++    DBusMessageIter entry, variant, array;
++    const unsigned char *p = (const unsigned char *)value;
++
++    open_entry( dict, &entry, &variant, key, "ay" );
++    p_dbus_message_iter_open_container( &variant, DBUS_TYPE_ARRAY, "y", &array );
++    do p_dbus_message_iter_append_basic( &array, DBUS_TYPE_BYTE, p ); while (*p++);
++    p_dbus_message_iter_close_container( &variant, &array );
++    close_entry( dict, &entry, &variant );
++}
++
++/* Windows wildcards match case-insensitively, the portal's globs don't: "*.cpp"
++ * becomes "*.[cC][pP][pP]"; "[" is literal in Windows, so it is escaped. */
++static char *make_glob( const char *pattern, size_t len )
++{
++    char *ret, *p;
++    size_t i;
++
++    if (len == 3 && !memcmp( pattern, "*.*", 3 )) return strdup( "*" );
++    if (!(ret = p = malloc( len * 4 + 1 ))) return NULL;
++    for (i = 0; i < len; i++)
++    {
++        unsigned char c = pattern[i];
++        if (c < 0x80 && isalpha( c ) && tolower( c ) != toupper( c ))
++        {
++            *p++ = '[';
++            *p++ = tolower( c );
++            *p++ = toupper( c );
++            *p++ = ']';
++        }
++        else if (c == '[')
++        {
++            memcpy( p, "[[]", 3 );
++            p += 3;
++        }
++        else *p++ = c;
++    }
++    *p = 0;
++    return ret;
++}
++
++/* (sa(us)): name and glob patterns */
++static void append_filter( DBusMessageIter *iter, const char *name, const char *patterns )
++{
++    DBusMessageIter filter, list, item;
++    const char *p = patterns, *end;
++    dbus_uint32_t glob = 0;
++
++    p_dbus_message_iter_open_container( iter, DBUS_TYPE_STRUCT, NULL, &filter );
++    p_dbus_message_iter_append_basic( &filter, DBUS_TYPE_STRING, &name );
++    p_dbus_message_iter_open_container( &filter, DBUS_TYPE_ARRAY, "(us)", &list );
++    for (;;)
++    {
++        char *pattern;
++
++        while (*p == ' ' || *p == ';') p++;
++        if (!*p) break;
++        for (end = p; *end && *end != ';'; end++);
++        while (end > p && end[-1] == ' ') end--;
++        if ((pattern = make_glob( p, end - p )))
++        {
++            p_dbus_message_iter_open_container( &list, DBUS_TYPE_STRUCT, NULL, &item );
++            p_dbus_message_iter_append_basic( &item, DBUS_TYPE_UINT32, &glob );
++            p_dbus_message_iter_append_basic( &item, DBUS_TYPE_STRING, &pattern );
++            p_dbus_message_iter_close_container( &list, &item );
++            free( pattern );
++        }
++        p = end;
++    }
++    p_dbus_message_iter_close_container( &filter, &list );
++    p_dbus_message_iter_close_container( iter, &filter );
++}
++
++static void append_filters( DBusMessageIter *dict, const struct portal_open_params *params )
++{
++    DBusMessageIter entry, variant, array;
++    const char *name = params->filters, *patterns;
++    UINT32 i;
++
++    open_entry( dict, &entry, &variant, "filters", "a(sa(us))" );
++    p_dbus_message_iter_open_container( &variant, DBUS_TYPE_ARRAY, "(sa(us))", &array );
++    for (i = 0; i < params->filter_count; i++)
++    {
++        patterns = name + strlen( name ) + 1;
++        append_filter( &array, name, patterns );
++        name = patterns + strlen( patterns ) + 1;
++    }
++    p_dbus_message_iter_close_container( &variant, &array );
++    close_entry( dict, &entry, &variant );
++
++    if (params->current_filter >= params->filter_count) return;
++    name = params->filters;
++    for (i = 0; i < params->current_filter; i++)
++    {
++        name += strlen( name ) + 1;
++        name += strlen( name ) + 1;
++    }
++    open_entry( dict, &entry, &variant, "current_filter", "(sa(us))" );
++    append_filter( &variant, name, name + strlen( name ) + 1 );
++    close_entry( dict, &entry, &variant );
++}
++
++static NTSTATUS portal_open( void *args )
++{
++    struct portal_open_params *params = args;
++    const char *method = (params->flags & PORTAL_SAVE) ? "SaveFile" : "OpenFile";
++    char token[32], match[512], *sender, *p;
++    DBusMessage *call, *reply;
++    DBusMessageIter iter, dict;
++    struct request *req;
++    const char *path, *name;
++    DBusError error;
++    UINT32 i;
++
++    if (!load_dbus()) return STATUS_NOT_SUPPORTED;
++    if (!(req = calloc( 1, sizeof(*req) ))) return STATUS_NO_MEMORY;
++
++    p_dbus_error_init( &error );
++    if (!(req->connection = p_dbus_bus_get_private( DBUS_BUS_SESSION, &error )))
++    {
++        WARN( "no session bus: %s\n", error.message );
++        p_dbus_error_free( &error );
++        free_request( req );
++        return STATUS_NOT_SUPPORTED;
++    }
++    p_dbus_connection_set_exit_on_disconnect( req->connection, FALSE );
++
++    /* the Request object path is known in advance; listen before asking, so the
++     * Response can't be missed */
++    snprintf( token, sizeof(token), "wine%u_%p", (unsigned)getpid(), req );
++    for (p = token; *p; p++) if (!isalnum( (unsigned char)*p )) *p = '_';
++    if (!(sender = strdup( p_dbus_bus_get_unique_name( req->connection ) + 1 ))) goto failed;
++    for (p = sender; *p; p++) if (*p == '.') *p = '_';
++    if (!(req->path = malloc( strlen( sender ) + strlen( token ) + 64 )))
++    {
++        free( sender );
++        goto failed;
++    }
++    sprintf( req->path, "/org/freedesktop/portal/desktop/request/%s/%s", sender, token );
++    free( sender );
++    snprintf( match, sizeof(match), "type='signal',interface='org.freedesktop.portal.Request',"
++              "member='Response',path='%s'", req->path );
++    p_dbus_bus_add_match( req->connection, match, &error );
++    if (p_dbus_error_is_set( &error )) goto failed;
++
++    if (!(call = p_dbus_message_new_method_call( "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
++                                                 "org.freedesktop.portal.FileChooser", method )))
++        goto failed;
++    p_dbus_message_iter_init_append( call, &iter );
++    p_dbus_message_iter_append_basic( &iter, DBUS_TYPE_STRING, &params->parent );
++    p_dbus_message_iter_append_basic( &iter, DBUS_TYPE_STRING, &params->title );
++    p_dbus_message_iter_open_container( &iter, DBUS_TYPE_ARRAY, "{sv}", &dict );
++    append_string_entry( &dict, "handle_token", token );
++    append_bool_entry( &dict, "modal", TRUE );
++    if (params->accept_label) append_string_entry( &dict, "accept_label", params->accept_label );
++    if (!(params->flags & PORTAL_SAVE))
++    {
++        append_bool_entry( &dict, "multiple", params->flags & PORTAL_MULTIPLE );
++        append_bool_entry( &dict, "directory", params->flags & PORTAL_DIRECTORY );
++    }
++    else if (params->name) append_string_entry( &dict, "current_name", params->name );
++    if (params->folder) append_bytes_entry( &dict, "current_folder", params->folder );
++    if (params->filter_count) append_filters( &dict, params );
++    p_dbus_message_iter_close_container( &iter, &dict );
++
++    reply = p_dbus_connection_send_with_reply_and_block( req->connection, call, -1, &error );
++    p_dbus_message_unref( call );
++    if (!reply)
++    {
++        WARN( "%s failed: %s\n", method, error.message );
++        goto failed;
++    }
++    /* older portals pick their own path */
++    if (p_dbus_message_iter_init( reply, &iter ) && p_dbus_message_iter_get_arg_type( &iter ) == DBUS_TYPE_OBJECT_PATH)
++    {
++        p_dbus_message_iter_get_basic( &iter, &path );
++        if (strcmp( path, req->path ))
++        {
++            free( req->path );
++            req->path = strdup( path );
++            snprintf( match, sizeof(match), "type='signal',interface='org.freedesktop.portal.Request',"
++                      "member='Response',path='%s'", path );
++            p_dbus_bus_add_match( req->connection, match, NULL );
++        }
++    }
++    p_dbus_message_unref( reply );
++    if (!req->path) goto failed;
++
++    /* kept to map the chosen filter back to its index */
++    if (params->filter_count && (req->filter_names = calloc( params->filter_count, sizeof(char *) )))
++    {
++        name = params->filters;
++        for (i = 0; i < params->filter_count; i++)
++        {
++            req->filter_names[i] = strdup( name );
++            name += strlen( name ) + 1;
++            name += strlen( name ) + 1;
++        }
++        req->filter_count = params->filter_count;
++    }
++
++    TRACE( "%s request %s\n", method, req->path );
++    params->request = (UINT_PTR)req;
++    return STATUS_SUCCESS;
++
++failed:
++    p_dbus_error_free( &error );
++    free_request( req );
++    return STATUS_NOT_SUPPORTED;
++}
++
++static int hex_value( char c )
++{
++    if (c >= '0' && c <= '9') return c - '0';
++    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
++    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
++    return -1;
++}
++
++/* file:// URIs only; returns the decoded length, or 0 */
++static size_t uri_to_path( const char *uri, char *out )
++{
++    const char *p;
++    size_t len = 0;
++
++    if (strncmp( uri, "file://", 7 )) return 0;
++    p = uri + 7;
++    if (*p != '/')  /* file://host/path, local host only */
++    {
++        if (strncmp( p, "localhost/", 10 )) return 0;
++        p += 9;
++    }
++    while (*p)
++    {
++        if (*p == '%' && hex_value( p[1] ) >= 0 && hex_value( p[2] ) >= 0)
++        {
++            out[len++] = hex_value( p[1] ) * 16 + hex_value( p[2] );
++            p += 3;
++        }
++        else out[len++] = *p++;
++    }
++    out[len++] = 0;
++    return len;
++}
++
++static void parse_response( struct request *req, DBusMessage *msg )
++{
++    DBusMessageIter iter, dict, entry, variant, array, filter;
++    dbus_uint32_t response;
++    const char *key, *str;
++
++    req->done = TRUE;
++    req->response = 2;
++    if (!p_dbus_message_iter_init( msg, &iter ) || p_dbus_message_iter_get_arg_type( &iter ) != DBUS_TYPE_UINT32)
++        return;
++    p_dbus_message_iter_get_basic( &iter, &response );
++    req->response = response;
++    if (response || !p_dbus_message_iter_next( &iter ) || p_dbus_message_iter_get_arg_type( &iter ) != DBUS_TYPE_ARRAY)
++        return;
++
++    p_dbus_message_iter_recurse( &iter, &dict );
++    while (p_dbus_message_iter_get_arg_type( &dict ) == DBUS_TYPE_DICT_ENTRY)
++    {
++        p_dbus_message_iter_recurse( &dict, &entry );
++        p_dbus_message_iter_get_basic( &entry, &key );
++        p_dbus_message_iter_next( &entry );
++        p_dbus_message_iter_recurse( &entry, &variant );
++
++        if (!strcmp( key, "uris" ) && p_dbus_message_iter_get_arg_type( &variant ) == DBUS_TYPE_ARRAY)
++        {
++            p_dbus_message_iter_recurse( &variant, &array );
++            while (p_dbus_message_iter_get_arg_type( &array ) == DBUS_TYPE_STRING)
++            {
++                char *paths;
++                size_t len;
++
++                p_dbus_message_iter_get_basic( &array, &str );
++                if ((paths = realloc( req->paths, req->paths_size + strlen( str ) + 1 )))
++                {
++                    req->paths = paths;
++                    if ((len = uri_to_path( str, paths + req->paths_size ))) req->paths_size += len;
++                    else WARN( "ignoring %s\n", debugstr_a(str) );
++                }
++                p_dbus_message_iter_next( &array );
++            }
++        }
++        else if (!strcmp( key, "current_filter" ) && p_dbus_message_iter_get_arg_type( &variant ) == DBUS_TYPE_STRUCT)
++        {
++            p_dbus_message_iter_recurse( &variant, &filter );
++            if (p_dbus_message_iter_get_arg_type( &filter ) == DBUS_TYPE_STRING)
++            {
++                p_dbus_message_iter_get_basic( &filter, &str );
++                free( req->filter );
++                req->filter = strdup( str );
++            }
++        }
++        p_dbus_message_iter_next( &dict );
++    }
++}
++
++/* blocks until the dialog is closed or the request cancelled */
++static NTSTATUS portal_wait( void *args )
++{
++    struct request *req = (struct request *)(UINT_PTR)((struct portal_request_params *)args)->request;
++    DBusMessage *msg;
++
++    while (!req->done)
++    {
++        if (req->cancelled)
++        {
++            req->done = TRUE;
++            req->response = 1;
++            break;
++        }
++        /* wakes up now and then to notice a cancel */
++        if (!p_dbus_connection_read_write( req->connection, 250 ))
++        {
++            req->done = TRUE;
++            req->response = 2;
++            break;
++        }
++        while (!req->done && (msg = p_dbus_connection_pop_message( req->connection )))
++        {
++            if (p_dbus_message_is_signal( msg, "org.freedesktop.portal.Request", "Response" ) &&
++                p_dbus_message_get_path( msg ) && !strcmp( p_dbus_message_get_path( msg ), req->path ))
++                parse_response( req, msg );
++            p_dbus_message_unref( msg );
++        }
++    }
++    TRACE( "%s response %u\n", req->path, req->response );
++    return STATUS_SUCCESS;
++}
++
++/* closes the dialog; may be called while another thread waits */
++static NTSTATUS portal_cancel( void *args )
++{
++    struct request *req = (struct request *)(UINT_PTR)((struct portal_request_params *)args)->request;
++    DBusMessage *call;
++
++    if ((call = p_dbus_message_new_method_call( "org.freedesktop.portal.Desktop", req->path,
++                                                "org.freedesktop.portal.Request", "Close" )))
++    {
++        p_dbus_connection_send( req->connection, call, NULL );
++        p_dbus_connection_flush( req->connection );
++        p_dbus_message_unref( call );
++    }
++    __atomic_store_n( &req->cancelled, 1, __ATOMIC_SEQ_CST );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS portal_result( void *args )
++{
++    struct portal_result_params *params = args;
++    struct request *req = (struct request *)(UINT_PTR)params->request;
++    UINT32 i;
++
++    params->response = req->response;
++    params->filter = ~0u;
++    for (i = 0; req->filter && i < req->filter_count; i++)
++        if (req->filter_names[i] && !strcmp( req->filter_names[i], req->filter )) params->filter = i;
++    params->needed = req->paths_size + 1;
++    if (params->size < params->needed) return STATUS_BUFFER_TOO_SMALL;
++    if (req->paths_size) memcpy( params->buffer, req->paths, req->paths_size );
++    params->buffer[req->paths_size] = 0;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS portal_close( void *args )
++{
++    free_request( (struct request *)(UINT_PTR)((struct portal_request_params *)args)->request );
++    return STATUS_SUCCESS;
++}
++
++#else  /* SONAME_LIBDBUS_1 */
++
++static NTSTATUS portal_open( void *args ) { return STATUS_NOT_SUPPORTED; }
++static NTSTATUS portal_wait( void *args ) { return STATUS_NOT_SUPPORTED; }
++static NTSTATUS portal_cancel( void *args ) { return STATUS_NOT_SUPPORTED; }
++static NTSTATUS portal_result( void *args ) { return STATUS_NOT_SUPPORTED; }
++static NTSTATUS portal_close( void *args ) { return STATUS_NOT_SUPPORTED; }
++
++#endif  /* SONAME_LIBDBUS_1 */
++
++const unixlib_entry_t __wine_unix_call_funcs[] =
++{
++    portal_open,
++    portal_wait,
++    portal_cancel,
++    portal_result,
++    portal_close,
++};
++
++C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_portal_funcs_count );
++
++#ifdef _WIN64
++
++static NTSTATUS wow64_not_supported( void *args ) { return STATUS_NOT_SUPPORTED; }
++
++/* 32-bit programs keep Wine's own dialog */
++const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
++{
++    wow64_not_supported,
++    wow64_not_supported,
++    wow64_not_supported,
++    wow64_not_supported,
++    wow64_not_supported,
++};
++
++C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_portal_funcs_count );
++
++#endif  /* _WIN64 */
+--- a/dlls/comdlg32/itemdlg.c
++++ b/dlls/comdlg32/itemdlg.c
+@@ -26,11 +26,13 @@
+ #include "winuser.h"
+ #include "wingdi.h"
+ #include "winreg.h"
++#include "winternl.h"
+ #include "shlwapi.h"
+ 
+ #include "commdlg.h"
+ #include "cdlg.h"
+ #include "filedlgbrowser.h"
++#include "unixlib.h"
+ 
+ #include "wine/debug.h"
+ #include "wine/list.h"
+@@ -147,6 +149,8 @@
+     GUID client_guid;
+ 
+     HANDLE user_actctx;
++    BOOL portal_shown;
++    BOOL app_defaultfolder;
+ } FileDialogImpl;
+ 
+ /**************************************************************************
+@@ -2409,6 +2413,319 @@
+ }
+ 
+ /**************************************************************************
++ * The desktop portal's file chooser
++ *
++ * When the dialog isn't customized, it is shown by the desktop
++ * (org.freedesktop.portal.FileChooser) instead, as a child of the owner's
++ * window. Wine's own dialog is used whenever the portal isn't available.
++ */
++static BOOL portal_available;
++
++static BOOL WINAPI init_portal(INIT_ONCE *once, void *param, void **context)
++{
++    portal_available = !__wine_init_unix_call();
++    return TRUE;
++}
++
++static char *strdupWtoU8(const WCHAR *str)
++{
++    int len = WideCharToMultiByte(CP_UTF8, 0, str, -1, NULL, 0, NULL, NULL);
++    char *ret = malloc(len);
++
++    if (ret) WideCharToMultiByte(CP_UTF8, 0, str, -1, ret, len, NULL, NULL);
++    return ret;
++}
++
++/* "&Open" to "_Open"; "&&" is a literal "&", and a literal "_" is "__" */
++static char *portal_label(const WCHAR *label)
++{
++    WCHAR *buf = malloc((lstrlenW(label) * 2 + 1) * sizeof(WCHAR)), *p = buf;
++    char *ret;
++
++    if (!buf) return NULL;
++    for (; *label; label++)
++    {
++        if (*label == '&' && label[1] == '&') *p++ = *label++;
++        else if (*label == '&') *p++ = '_';
++        else if (*label == '_') { *p++ = '_'; *p++ = '_'; }
++        else *p++ = *label;
++    }
++    *p = 0;
++    ret = strdupWtoU8(buf);
++    free(buf);
++    return ret;
++}
++
++static char *portal_unix_path(const WCHAR *path)
++{
++    char *unix_path, *ret = NULL;
++
++    if ((unix_path = wine_get_unix_file_name(path)))
++    {
++        ret = strdup(unix_path);
++        HeapFree(GetProcessHeap(), 0, unix_path);
++    }
++    return ret;
++}
++
++static WCHAR *item_path(IShellItem *item)
++{
++    WCHAR *path;
++
++    if (!item || FAILED(IShellItem_GetDisplayName(item, SIGDN_FILESYSPATH, &path)))
++        return NULL;
++    return path;
++}
++
++/* SetFileName() may be given a path; like Windows, it then overrides the folder */
++static void portal_folder_and_name(FileDialogImpl *This, char **folder, char **name)
++{
++    WCHAR *dir = item_path(This->psi_setfolder ? This->psi_setfolder :
++                           This->app_defaultfolder ? This->psi_defaultfolder : NULL);
++    const WCHAR *file_name = This->dlg_type == ITEMDLG_TYPE_SAVE ? This->set_filename : NULL;
++    const WCHAR *base = file_name, *p;
++    WCHAR buf[MAX_PATH], *sub;
++
++    *name = NULL;
++    for (p = file_name; p && *p; p++) if (*p == '\\' || *p == '/') base = p + 1;
++    if (base != file_name && (sub = malloc((base - file_name + 1) * sizeof(WCHAR))))
++    {
++        memcpy(sub, file_name, (base - file_name) * sizeof(WCHAR));
++        sub[base - file_name] = 0;
++        if ((dir && PathIsRelativeW(sub) && PathCombineW(buf, dir, sub)) ||
++            GetFullPathNameW(sub, ARRAY_SIZE(buf), buf, NULL))
++        {
++            CoTaskMemFree(dir);
++            dir = NULL;
++            *folder = portal_unix_path(buf);
++        }
++        free(sub);
++    }
++    if (dir) *folder = portal_unix_path(dir);
++    CoTaskMemFree(dir);
++    if (base && *base) *name = strdupWtoU8(base);
++}
++
++/* the toplevel's xdg-foreign handle, published by the Wayland driver */
++static char *portal_parent(HWND owner)
++{
++    HWND root = owner ? GetAncestor(owner, GA_ROOT) : NULL;
++    ATOM atom = root ? HandleToUlong(GetPropW(root, L"__wine_xdg_foreign_handle")) : 0;
++    char handle[256], *ret;
++
++    if (!atom || !GlobalGetAtomNameA(atom, handle, sizeof(handle)))
++        return strdup("");
++    if ((ret = malloc(strlen(handle) + sizeof("wayland:"))))
++        sprintf(ret, "wayland:%s", handle);
++    return ret;
++}
++
++/* filter_count pairs of UTF-8 strings: name, patterns */
++static char *portal_filters(FileDialogImpl *This, UINT *count)
++{
++    char *ret = NULL, *p;
++    size_t size = 0;
++    UINT i;
++    int len;
++
++    *count = 0;
++    for (i = 0; i < This->filterspec_count; i++)
++    {
++        if (!This->filterspecs[i].pszName || !This->filterspecs[i].pszSpec) return NULL;
++        size += WideCharToMultiByte(CP_UTF8, 0, This->filterspecs[i].pszName, -1, NULL, 0, NULL, NULL);
++        size += WideCharToMultiByte(CP_UTF8, 0, This->filterspecs[i].pszSpec, -1, NULL, 0, NULL, NULL);
++    }
++    if (!size || !(ret = p = malloc(size))) return NULL;
++    for (i = 0; i < This->filterspec_count; i++)
++    {
++        len = WideCharToMultiByte(CP_UTF8, 0, This->filterspecs[i].pszName, -1, p, ret + size - p, NULL, NULL);
++        p += len;
++        len = WideCharToMultiByte(CP_UTF8, 0, This->filterspecs[i].pszSpec, -1, p, ret + size - p, NULL, NULL);
++        p += len;
++    }
++    *count = This->filterspec_count;
++    return ret;
++}
++
++static DWORD WINAPI portal_wait_thread(void *arg)
++{
++    return WINE_UNIX_CALL(unix_portal_wait, arg);
++}
++
++/* runs the owner's messages until the dialog is closed, like a modal dialog */
++static void portal_modal_loop(struct portal_request_params *req, HANDLE thread)
++{
++    BOOL quit = FALSE;
++    WPARAM quit_code = 0;
++    MSG msg;
++
++    while (MsgWaitForMultipleObjects(1, &thread, FALSE, INFINITE, QS_ALLINPUT) != WAIT_OBJECT_0)
++    {
++        while (PeekMessageW(&msg, 0, 0, 0, PM_REMOVE))
++        {
++            if (msg.message == WM_QUIT)
++            {
++                quit = TRUE;
++                quit_code = msg.wParam;
++                WINE_UNIX_CALL(unix_portal_cancel, req);
++                break;
++            }
++            TranslateMessage(&msg);
++            DispatchMessageW(&msg);
++        }
++        if (quit)
++        {
++            WaitForSingleObject(thread, INFINITE);
++            break;
++        }
++    }
++    if (quit) PostQuitMessage(quit_code);
++}
++
++static HRESULT portal_results(FileDialogImpl *This, struct portal_request_params *req)
++{
++    struct portal_result_params params = { .request = req->request };
++    LPITEMIDLIST *pidla = NULL;
++    IShellFolder *psf_desktop;
++    UINT count = 0, i;
++    char *path;
++    HRESULT hr;
++
++    WINE_UNIX_CALL(unix_portal_result, &params);
++    if (params.response)
++        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
++    if (!(params.buffer = malloc(params.needed)))
++        return E_OUTOFMEMORY;
++    params.size = params.needed;
++    WINE_UNIX_CALL(unix_portal_result, &params);
++
++    for (path = params.buffer; *path; path += strlen(path) + 1) count++;
++    if (!count || !(pidla = calloc(count, sizeof(*pidla))))
++    {
++        free(params.buffer);
++        return count ? E_OUTOFMEMORY : HRESULT_FROM_WIN32(ERROR_CANCELLED);
++    }
++    for (i = 0, path = params.buffer; *path; path += strlen(path) + 1)
++    {
++        WCHAR *dos_path = wine_get_dos_file_name(path);
++
++        TRACE("chose %s -> %s\n", debugstr_a(path), debugstr_w(dos_path));
++        if (!dos_path) continue;
++        if ((pidla[i] = SHSimpleIDListFromPath(dos_path))) i++;
++        HeapFree(GetProcessHeap(), 0, dos_path);
++    }
++    free(params.buffer);
++
++    hr = i ? SHGetDesktopFolder(&psf_desktop) : E_FAIL;
++    if (SUCCEEDED(hr))
++    {
++        if (This->psia_results)
++        {
++            IShellItemArray_Release(This->psia_results);
++            This->psia_results = NULL;
++        }
++        hr = SHCreateShellItemArray(NULL, psf_desktop, i, (PCUITEMID_CHILD_ARRAY)pidla, &This->psia_results);
++        IShellFolder_Release(psf_desktop);
++    }
++    while (i) ILFree(pidla[--i]);
++    free(pidla);
++
++    if (SUCCEEDED(hr) && params.filter < This->filterspec_count)
++    {
++        This->filetypeindex = params.filter;
++        set_current_filter(This, This->filterspecs[This->filetypeindex].pszSpec);
++    }
++    return hr;
++}
++
++/* returns FALSE to fall back to Wine's own dialog */
++static BOOL show_portal(FileDialogImpl *This, HWND owner, HRESULT *ret)
++{
++    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
++    struct portal_open_params params = { 0 };
++    struct portal_request_params req;
++    char *title, *label = NULL, *folder = NULL, *name = NULL, *filters = NULL, *parent;
++    HWND root = owner ? GetAncestor(owner, GA_ROOT) : NULL;
++    BOOL enabled = FALSE, shown = FALSE;
++    HANDLE thread;
++    WCHAR buf[64];
++
++    /* events and custom controls need Wine's dialog */
++    if (!list_empty(&This->events_clients) || !list_empty(&This->cctrls)) return FALSE;
++    /* the portal can't add the extension */
++    if (This->dlg_type == ITEMDLG_TYPE_SAVE && This->default_ext) return FALSE;
++
++    InitOnceExecuteOnce(&once, init_portal, NULL, NULL);
++    if (!portal_available) return FALSE;
++
++    if (This->custom_title)
++        title = strdupWtoU8(This->custom_title);
++    else
++    {
++        LoadStringW(COMDLG32_hInstance, IDS_OPEN, buf, ARRAY_SIZE(buf));
++        title = strdupWtoU8(buf);
++    }
++    if (This->custom_okbutton) label = portal_label(This->custom_okbutton);
++    /* without the application's own folder, the desktop's default is used
++     * rather than the stand-in Desktop folder */
++    portal_folder_and_name(This, &folder, &name);
++    parent = portal_parent(owner);
++
++    if (This->dlg_type == ITEMDLG_TYPE_SAVE)
++        params.flags |= PORTAL_SAVE;
++    else
++    {
++        if (This->options & FOS_ALLOWMULTISELECT) params.flags |= PORTAL_MULTIPLE;
++        if (This->options & FOS_PICKFOLDERS) params.flags |= PORTAL_DIRECTORY;
++    }
++    if (!(This->options & FOS_PICKFOLDERS))
++        filters = portal_filters(This, &params.filter_count);
++
++    params.parent = parent;
++    params.title = title;
++    params.accept_label = label;
++    params.folder = folder;
++    params.name = name;
++    params.filters = filters;
++    params.current_filter = params.filter_count ? This->filetypeindex : ~0u;
++
++    if (title && parent && !WINE_UNIX_CALL(unix_portal_open, &params))
++    {
++        req.request = params.request;
++        if (root) enabled = !EnableWindow(root, FALSE);
++        if ((thread = CreateThread(NULL, 0, portal_wait_thread, &req, 0, NULL)))
++        {
++            This->portal_shown = TRUE;
++            portal_modal_loop(&req, thread);
++            This->portal_shown = FALSE;
++            CloseHandle(thread);
++            *ret = portal_results(This, &req);
++            shown = TRUE;
++        }
++        else WINE_UNIX_CALL(unix_portal_cancel, &req);
++        if (enabled)
++        {
++            EnableWindow(root, TRUE);
++            /* the desktop may hand the owner back its activation while it is
++             * still disabled, which leaves it without the focus that comes
++             * with activation */
++            if (GetActiveWindow() == root && !GetFocus()) SetFocus(root);
++        }
++        WINE_UNIX_CALL(unix_portal_close, &req);
++    }
++    else WARN("portal not available, using Wine's dialog\n");
++
++    free(title);
++    free(label);
++    free(folder);
++    free(name);
++    free(filters);
++    free(parent);
++    TRACE("portal %s, hr %#lx\n", shown ? "shown" : "not shown", shown ? *ret : 0);
++    return shown;
++}
++
++/**************************************************************************
+  * IFileDialog implementation
+  */
+ static inline FileDialogImpl *impl_from_IFileDialog2(IFileDialog2 *iface)
+@@ -2527,10 +2844,16 @@
+ static HRESULT WINAPI IFileDialog2_fnShow(IFileDialog2 *iface, HWND hwndOwner)
+ {
+     FileDialogImpl *This = impl_from_IFileDialog2(iface);
++    HRESULT hr;
+     TRACE("%p (%p)\n", iface, hwndOwner);
+ 
+     This->opendropdown_has_selection = FALSE;
+ 
++    if (This->dlg_hwnd || This->portal_shown)
++        return E_UNEXPECTED;
++    if (show_portal(This, hwndOwner, &hr))
++        return hr;
++
+     return create_dialog(This, hwndOwner);
+ }
+ 
+@@ -2711,6 +3034,7 @@
+         IShellItem_Release(This->psi_defaultfolder);
+ 
+     This->psi_defaultfolder = psi;
++    This->app_defaultfolder = TRUE;
+ 
+     if(This->psi_defaultfolder)
+         IShellItem_AddRef(This->psi_defaultfolder);

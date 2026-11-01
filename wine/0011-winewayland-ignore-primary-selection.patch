@@ -1,0 +1,31 @@
+--- a/dlls/winewayland.drv/wayland_data_device.c
++++ b/dlls/winewayland.drv/wayland_data_device.c
+@@ -585,11 +585,28 @@
+ {
+ }
+ 
++static void data_control_device_primary_selection(
++    void *data,
++    struct zwlr_data_control_device_v1 *zwlr_data_control_device_v1,
++    struct zwlr_data_control_offer_v1 *zwlr_data_control_offer_v1)
++{
++    struct wayland_data_offer *data_offer;
++
++    /* A version 2 event, which some compositors send even to version 1
++     * devices. Windows has no primary selection. */
++    if (!zwlr_data_control_offer_v1) return;
++    if ((data_offer = zwlr_data_control_offer_v1_get_user_data(zwlr_data_control_offer_v1)))
++        wayland_data_offer_destroy(data_offer);
++    else
++        zwlr_data_control_offer_v1_destroy(zwlr_data_control_offer_v1);
++}
++
+ static const struct zwlr_data_control_device_v1_listener data_control_device_listener =
+ {
+     data_control_device_data_offer,
+     data_control_device_selection,
+     data_control_device_finished,
++    data_control_device_primary_selection,
+ };
+ 
+ /**********************************************************************

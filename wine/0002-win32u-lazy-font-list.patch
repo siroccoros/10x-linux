@@ -1,0 +1,162 @@
+--- a/dlls/win32u/font.c
++++ b/dlls/win32u/font.c
+@@ -95,6 +95,7 @@
+ };
+ 
+ static const struct font_backend_funcs *font_funcs;
++static void ensure_font_list(void);
+ 
+ static const MAT2 identity = { {0,1}, {0,0}, {0,0}, {0,1} };
+ 
+@@ -3160,6 +3161,8 @@
+ {
+     struct font_physdev *physdev;
+ 
++    ensure_font_list();
++
+     if (!font_funcs) return TRUE;
+     if (!(physdev = calloc( 1, sizeof(*physdev) ))) return FALSE;
+     push_dc_driver( dev, &physdev->dev, &font_driver );
+@@ -6260,6 +6263,8 @@
+         .dfFace           = offsetof( struct fontdir, szFaceName ),
+     };
+ 
++    ensure_font_list();
++
+     if (size < sizeof(fontdir)) return 0;
+     if (len <= sizeof(WCHAR)) return 0;
+     if (path[len / sizeof(WCHAR) - 1]) return 0;
+@@ -6723,32 +6728,28 @@
+     return reg_open_key( NULL, bufferW, len * sizeof(WCHAR) );
+ }
+ 
+-/***********************************************************************
+- *              font_init
+- */
+-UINT font_init(void)
++/* Building the font list is the costliest part of starting a process that
++ * loads user32, yet a program that never draws or enumerates text (wmic, run
++ * by 10x four times while it starts) never needs it. It is built on first use
++ * instead: every DC gets the font driver at creation (font_CreateDC), and the
++ * entry points that work without a DC load it themselves. */
++static pthread_once_t font_list_once = PTHREAD_ONCE_INIT;
++static BOOL font_list_wanted;
++
++static void load_font_list(void)
+ {
+     OBJECT_ATTRIBUTES attr = { sizeof(attr) };
+     UNICODE_STRING name;
+     HANDLE mutex;
+     DWORD disposition;
+-    UINT dpi = 0;
+ 
+     static WCHAR wine_font_mutexW[] =
+         {'\\','B','a','s','e','N','a','m','e','d','O','b','j','e','c','t','s',
+          '\\','_','_','W','I','N','E','_','F','O','N','T','_','M','U','T','E','X','_','_'};
+-    static const WCHAR wine_fonts_keyW[] =
+-        {'S','o','f','t','w','a','r','e','\\','W','i','n','e','\\','F','o','n','t','s'};
+     static const WCHAR cacheW[] = {'C','a','c','h','e'};
+ 
+-    if (!(hkcu_key = open_hkcu())) return 0;
+-    wine_fonts_key = reg_create_key( hkcu_key, wine_fonts_keyW, sizeof(wine_fonts_keyW), 0, NULL );
+-    if (wine_fonts_key) dpi = init_font_options();
+-    if (!dpi) return 96;
+-    update_codepage( dpi );
+-
+-    if (!(font_funcs = init_freetype_lib()))
+-        return dpi;
++    if (!font_list_wanted) return;
++    if (!(font_funcs = init_freetype_lib())) return;
+ 
+     load_system_bitmap_fonts();
+     load_file_system_fonts();
+@@ -6759,7 +6760,7 @@
+     name.Buffer = wine_font_mutexW;
+     name.Length = name.MaximumLength = sizeof(wine_font_mutexW);
+ 
+-    if (NtCreateMutant( &mutex, MUTEX_ALL_ACCESS, &attr, FALSE ) < 0) return dpi;
++    if (NtCreateMutant( &mutex, MUTEX_ALL_ACCESS, &attr, FALSE ) < 0) return;
+     NtWaitForSingleObject( mutex, FALSE, NULL );
+ 
+     wine_fonts_cache_key = reg_create_key( wine_fonts_key, cacheW, sizeof(cacheW),
+@@ -6786,6 +6787,29 @@
+     font_funcs->fonts_loaded();
+     dump_gdi_font_list();
+     dump_gdi_font_subst();
++}
++
++static void ensure_font_list(void)
++{
++    pthread_once( &font_list_once, load_font_list );
++}
++
++/***********************************************************************
++ *              font_init
++ */
++UINT font_init(void)
++{
++    UINT dpi = 0;
++
++    static const WCHAR wine_fonts_keyW[] =
++        {'S','o','f','t','w','a','r','e','\\','W','i','n','e','\\','F','o','n','t','s'};
++
++    if (!(hkcu_key = open_hkcu())) return 0;
++    wine_fonts_key = reg_create_key( hkcu_key, wine_fonts_keyW, sizeof(wine_fonts_keyW), 0, NULL );
++    if (wine_fonts_key) dpi = init_font_options();
++    if (!dpi) return 96;
++    update_codepage( dpi );
++    font_list_wanted = TRUE;
+     return dpi;
+ }
+ 
+@@ -6795,6 +6819,7 @@
+ INT WINAPI NtGdiAddFontResourceW( const WCHAR *str, ULONG size, ULONG files, DWORD flags,
+                                   DWORD tid, void *dv )
+ {
++    ensure_font_list();
+     if (!font_funcs) return 1;
+     return add_font_resource( str, flags );
+ }
+@@ -6809,6 +6834,8 @@
+     DWORD num_fonts;
+     void *copy;
+ 
++    ensure_font_list();
++
+     if (!ptr || !size || !count)
+     {
+         RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
+@@ -6863,6 +6890,7 @@
+ BOOL WINAPI NtGdiRemoveFontResourceW( const WCHAR *str, ULONG size, ULONG files, DWORD flags,
+                                       DWORD tid, void *dv )
+ {
++    ensure_font_list();
+     if (!font_funcs) return TRUE;
+     return remove_font_resource( str, flags );
+ }
+@@ -6941,6 +6969,7 @@
+  */
+ BOOL WINAPI NtGdiGetRasterizerCaps( RASTERIZER_STATUS *status, UINT size )
+ {
++    ensure_font_list();
+     status->nSize = sizeof(RASTERIZER_STATUS);
+     status->wFlags = font_funcs ? (TT_AVAILABLE | TT_ENABLED) : 0;
+     status->nLanguageID = 0;
+@@ -6957,6 +6986,8 @@
+     DWORD tag = 0, size;
+     BOOL ret = FALSE;
+ 
++    ensure_font_list();
++
+     if (!font_funcs) return FALSE;
+     pthread_mutex_lock( &font_lock );
+     if ((font = get_font_from_handle( instance_id )))
+@@ -6982,6 +7013,8 @@
+     struct gdi_font *font;
+     BOOL ret = FALSE;
+ 
++    ensure_font_list();
++
+     pthread_mutex_lock( &font_lock );
+ 
+     if ((font = get_font_from_handle( instance_id )))

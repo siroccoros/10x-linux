@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=10x
+GenericName=C++ Editor
+Comment=High-performance C++ editor (Windows build, via Wine)
+Exec=10x %F
+Icon=10x-editor
+Terminal=false
+StartupWMClass=10x.exe
+Categories=Development;IDE;TextEditor;
+Keywords=10x;cpp;c++;editor;code;
+MimeType=text/plain;text/x-c;text/x-csrc;text/x-chdr;text/x-c++;text/x-c++src;text/x-c++hdr;

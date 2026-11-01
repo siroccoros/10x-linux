@@ -1,0 +1,262 @@
+--- a/dlls/win32u/font.c
++++ b/dlls/win32u/font.c
+@@ -6660,6 +6660,67 @@
+     NtClose( hkey );
+ }
+ 
++/* The names load_registry_fonts() finds in the Fonts key, kept in the volatile
++ * font cache key. The Fonts key lists every font (~1150 on a typical system)
++ * and enumerating it costs each process that loads the font list a server
++ * call per entry (~7 ms), though nearly all are fonts already loaded. The
++ * list is used only while the key's last write time, value count and maximum
++ * name and data lengths match those read before it was recorded, so any change
++ * to the key since makes the next process enumerate it again. */
++
++struct reg_font_names
++{
++    LARGE_INTEGER last_write;
++    ULONG values, max_name, max_data, win9x;
++    ULONG count;
++    /* count times: ULONG type, ULONG name length in bytes, name (not terminated) */
++};
++
++static const WCHAR reg_font_names_valueW[] = {'R','e','g','i','s','t','r','y','F','o','n','t','s',0};
++
++static BOOL get_reg_font_names_stamp( HKEY hkey, struct reg_font_names *stamp )
++{
++    char buffer[sizeof(KEY_FULL_INFORMATION) + 256];
++    KEY_FULL_INFORMATION *info = (KEY_FULL_INFORMATION *)buffer;
++    ULONG size;
++
++    if (NtQueryKey( hkey, KeyFullInformation, info, sizeof(buffer), &size )) return FALSE;
++    memset( stamp, 0, sizeof(*stamp) );
++    stamp->last_write = info->LastWriteTime;
++    stamp->values = info->Values;
++    stamp->max_name = info->MaxValueNameLen;
++    stamp->max_data = info->MaxValueDataLen;
++    stamp->win9x = is_win9x();
++    return TRUE;
++}
++
++/* returns the recorded list if it matches stamp, to be freed by the caller */
++static struct reg_font_names *load_reg_font_names( const struct reg_font_names *stamp, ULONG *size )
++{
++    KEY_VALUE_PARTIAL_INFORMATION *info;
++    struct reg_font_names *names;
++    ULONG len = FIELD_OFFSET( KEY_VALUE_PARTIAL_INFORMATION, Data[sizeof(*names)] ) +
++                stamp->values * (2 * sizeof(ULONG) + stamp->max_name);
++
++    if (!wine_fonts_cache_key || !(info = malloc( len ))) return NULL;
++    if (!(len = query_reg_value( wine_fonts_cache_key, reg_font_names_valueW, info, len )) ||
++        info->Type != REG_BINARY || len < sizeof(*names) ||
++        memcmp( info->Data, stamp, offsetof( struct reg_font_names, count )))
++    {
++        free( info );
++        return NULL;
++    }
++    names = (struct reg_font_names *)info;
++    memmove( names, info->Data, len );
++    *size = len;
++    return names;
++}
++
++static void save_reg_font_names( const void *data, ULONG size )
++{
++    if (wine_fonts_cache_key) set_reg_value( wine_fonts_cache_key, reg_font_names_valueW, REG_BINARY, data, size );
++}
++
+ static void load_registry_fonts(void)
+ {
+     char value_buffer[FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data[MAX_PATH * sizeof(WCHAR)])];
+@@ -6668,6 +6729,9 @@
+     WCHAR value[LF_FULLFACESIZE + 12], *tmp, *path;
+     DWORD i = 0, dlen;
+     HKEY hkey;
++    struct reg_font_names stamp, *names = NULL;
++    char *record = NULL, *pos = NULL, *end = NULL;
++    ULONG size = 0, type, len, record_size = 0;
+ 
+     static const WCHAR dot_fonW[] = {'.','f','o','n',0};
+ 
+@@ -6681,9 +6745,59 @@
+         hkey = reg_open_key( NULL, fonts_winnt_config_keyW, sizeof(fonts_winnt_config_keyW) );
+     if (!hkey) return;
+ 
+-    while (reg_enum_value( hkey, i++, enum_info, sizeof(value_buffer), value, sizeof(value) ))
++    if (get_reg_font_names_stamp( hkey, &stamp ))
+     {
+-        if (enum_info->Type != REG_SZ) continue;
++        if ((names = load_reg_font_names( &stamp, &size )))
++        {
++            pos = (char *)(names + 1);
++            end = (char *)names + size;
++        }
++        else
++        {
++            /* the names fit in the data of the value entries read below */
++            record_size = sizeof(stamp) + stamp.values * (2 * sizeof(ULONG) + stamp.max_name);
++            if ((record = malloc( record_size )))
++            {
++                memcpy( record, &stamp, sizeof(stamp) );
++                pos = record + sizeof(stamp);
++            }
++        }
++    }
++
++    for (;;)
++    {
++        if (names)
++        {
++            if (i++ == names->count || end - pos < 2 * sizeof(ULONG)) break;
++            memcpy( &type, pos, sizeof(type) );
++            memcpy( &len, pos + sizeof(ULONG), sizeof(len) );
++            pos += 2 * sizeof(ULONG);
++            if (len > end - pos || len + sizeof(WCHAR) > sizeof(value)) break;
++            memcpy( value, pos, len );
++            value[len / sizeof(WCHAR)] = 0;
++            pos += len;
++        }
++        else
++        {
++            if (!reg_enum_value( hkey, i++, enum_info, sizeof(value_buffer), value, sizeof(value) )) break;
++            type = enum_info->Type;
++            len = enum_info->NameLength;
++            if (record && pos + 2 * sizeof(ULONG) + len <= record + record_size)
++            {
++                memcpy( pos, &type, sizeof(type) );
++                memcpy( pos + sizeof(ULONG), &len, sizeof(len) );
++                memcpy( pos + 2 * sizeof(ULONG), value, len );
++                pos += 2 * sizeof(ULONG) + len;
++                ((struct reg_font_names *)record)->count++;
++            }
++            else
++            {
++                free( record );
++                record = NULL;
++            }
++        }
++
++        if (type != REG_SZ) continue;
+         if ((tmp = wcsrchr( value, ' ' )) && !facename_compare( tmp, true_type_suffixW, -1 )) *tmp = 0;
+         if (find_face_from_full_name( value )) continue;
+         if (tmp && !*tmp) *tmp = ' ';
+@@ -6703,6 +6817,11 @@
+             add_system_font_resource( path, ADDFONT_ALLOW_BITMAP );
+         free( path );
+     }
++    /* only a complete list: enumeration also stops at an entry too large for the buffers */
++    if (record && ((struct reg_font_names *)record)->count == stamp.values)
++        save_reg_font_names( record, pos - record );
++    free( record );
++    free( names );
+     NtClose( hkey );
+ }
+ 
+@@ -6729,10 +6848,11 @@
+ }
+ 
+ /* Building the font list is the costliest part of starting a process that
+- * loads user32, yet a program that never draws or enumerates text (wmic, run
+- * by 10x four times while it starts) never needs it. It is built on first use
+- * instead: every DC gets the font driver at creation (font_CreateDC), and the
+- * entry points that work without a DC load it themselves. */
++ * loads user32, yet a program that never creates a DC never needs it. It is
++ * built on first use instead: every DC gets the font driver at creation
++ * (font_CreateDC), and the entry points that work without a DC load it
++ * themselves. (wmic, which 10x runs four times while it starts, still builds
++ * it: setting up the desktop window loads cursors through a screen DC.) */
+ static pthread_once_t font_list_once = PTHREAD_ONCE_INIT;
+ static BOOL font_list_wanted;
+ 
+--- a/dlls/win32u/freetype.c
++++ b/dlls/win32u/freetype.c
+@@ -1691,6 +1691,64 @@
+ 
+ enum { FC_FONT_FORMAT_UNKNOWN, FC_FONT_FORMAT_TYPE1, FC_FONT_FORMAT_OTHER };
+ 
++/* The DOS name of a font file. Converting a Unix path stats it and then each
++ * parent directory until one is a drive root, ~6 calls per font (~4 ms for
++ * 1100 fonts); fonts come grouped by directory, so the DOS name of the last
++ * directory is kept and only the file itself is checked. The memo is freed by
++ * passing NULL. */
++static WCHAR *get_font_dos_name( const char *unix_name )
++{
++    static char *memo_dir;
++    static WCHAR *memo_dos;
++    const char *slash;
++    unsigned int dir_len, base_len, len;
++    struct stat st;
++    WCHAR *ret;
++
++    if (!unix_name)
++    {
++        free( memo_dir );
++        free( memo_dos );
++        memo_dir = NULL;
++        memo_dos = NULL;
++        return NULL;
++    }
++
++    /* the file itself, and anything collapse_path() could change, the slow way */
++    slash = strrchr( unix_name, '/' );
++    if (!slash || slash == unix_name || strchr( slash, '\\' ) || slash[1] == '.' ||
++        stat( unix_name, &st ) || S_ISDIR( st.st_mode ))
++        goto slow;
++
++    dir_len = slash - unix_name;
++    if (!memo_dir || strlen( memo_dir ) != dir_len || memcmp( memo_dir, unix_name, dir_len ))
++    {
++        free( memo_dir );
++        free( memo_dos );
++        memo_dos = NULL;
++        if (!(memo_dir = malloc( dir_len + 1 ))) goto slow;
++        memcpy( memo_dir, unix_name, dir_len );
++        memo_dir[dir_len] = 0;
++        ntdll_get_dos_file_name( memo_dir, &memo_dos, FILE_OPEN );
++    }
++    /* only a name on a drive; a \\unix\ fallback is left to the slow way */
++    if (!memo_dos || memo_dos[1] != ':') goto slow;
++
++    len = wcslen( memo_dos );
++    base_len = strlen( slash + 1 );
++    if (!(ret = malloc( (len + base_len + 2) * sizeof(WCHAR) ))) goto slow;
++    memcpy( ret, memo_dos, len * sizeof(WCHAR) );
++    if (ret[len - 1] != '\\') ret[len++] = '\\';
++    len += ntdll_umbstowcs( slash + 1, base_len, ret + len, base_len );
++    ret[len] = 0;
++    return ret;
++
++slow:
++    ret = NULL;
++    ntdll_get_dos_file_name( unix_name, &ret, FILE_OPEN );
++    return ret;
++}
++
+ static void fontconfig_add_font_info( const struct fc_font *font, UINT flags )
+ {
+     WCHAR *dos_name;
+@@ -1717,7 +1775,7 @@
+     if (!(aa_flags = font->aa_flags)) aa_flags = default_aa_flags;
+     flags |= ADDFONT_AA_FLAGS(aa_flags);
+ 
+-    ntdll_get_dos_file_name( font->unix_name, &dos_name, FILE_OPEN );
++    dos_name = get_font_dos_name( font->unix_name );
+     add_unix_face( font->unix_name, dos_name, NULL, 0, font->face_index, flags, NULL );
+     free( dos_name );
+ }
+@@ -2189,6 +2247,7 @@
+         UINT i;
+ 
+         for (i = 0; i < fc_fonts_count; i++) fontconfig_add_font_info( &fc_fonts[i], ADDFONT_EXTERNAL_FONT );
++        get_font_dos_name( NULL );
+         fc_cache_free();
+         return;
+     }
+@@ -2200,6 +2259,7 @@
+     fc_cache_save( config );
+ 
+ done:
++    get_font_dos_name( NULL );
+     if (dir_list) pFcStrListDone( dir_list );
+     if (done_set) pFcStrSetDestroy( done_set );
+ }

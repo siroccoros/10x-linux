@@ -1,0 +1,78 @@
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -749,6 +749,47 @@
+     return TRUE;
+ }
+ 
++/* The primary monitor's DPI as the display driver last reported it, which on
++ * Windows is the system DPI unless the user chose one. */
++UINT get_primary_monitor_dpi(void)
++{
++    static const UINT prefix_len = sizeof("\\Registry\\Machine");
++    char buffer[4096];
++    KEY_VALUE_PARTIAL_INFORMATION *value = (void *)buffer;
++    const WCHAR *value_str = (const WCHAR *)value->Data;
++    HKEY video, config, hkey;
++    UINT index, dpi = 0, flags;
++    DWORD size;
++
++    if (!(video = reg_open_ascii_key( NULL, devicemap_video_keyA ))) return 0;
++    if (!(config = reg_open_ascii_key( NULL, config_keyA )))
++    {
++        NtClose( video );
++        return 0;
++    }
++
++    for (index = 0; !dpi; index++)
++    {
++        snprintf( buffer, sizeof(buffer), "\\Device\\Video%u", index );
++        size = query_reg_ascii_value( video, buffer, value, sizeof(buffer) );
++        if (!size || value->Type != REG_SZ || value->DataLength / sizeof(WCHAR) <= prefix_len) break;
++        if (!(hkey = reg_open_key( config, value_str + prefix_len,
++                                   value->DataLength - (prefix_len + 1) * sizeof(WCHAR) )))
++            continue;
++        flags = 0;
++        if (query_reg_ascii_value( hkey, "StateFlags", value, sizeof(buffer) ) && value->Type == REG_DWORD)
++            flags = *(const DWORD *)value->Data;
++        if ((flags & DISPLAY_DEVICE_PRIMARY_DEVICE) &&
++            query_reg_ascii_value( hkey, "Dpi", value, sizeof(buffer) ) && value->Type == REG_DWORD)
++            dpi = *(const DWORD *)value->Data;
++        NtClose( hkey );
++    }
++
++    NtClose( config );
++    NtClose( video );
++    return dpi;
++}
++
+ static BOOL read_monitor_from_registry( struct monitor *monitor )
+ {
+     char buffer[4096];
+@@ -6018,6 +6059,7 @@
+     config_key = reg_create_ascii_key( NULL, config_keyA, 0, NULL );
+ 
+     get_dword_entry( (union sysparam_all_entry *)&entry_LOGPIXELS, 0, &system_dpi, 0 );
++    if (!system_dpi) system_dpi = get_primary_monitor_dpi();
+     if (!system_dpi)  /* check fallback key */
+     {
+         if ((hkey = reg_open_ascii_key( config_key, "Software\\Fonts" )))
+--- a/dlls/win32u/font.c
++++ b/dlls/win32u/font.c
+@@ -4775,6 +4775,7 @@
+         }
+     }
+ 
++    if (!dpi) dpi = get_primary_monitor_dpi();
+     if (!dpi && (key = reg_open_key( NULL, fonts_config_keyW, sizeof(fonts_config_keyW) )))
+     {
+         if (get_key_value( key, "LogPixels", &val )) dpi = val;
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -176,6 +176,7 @@
+ extern HBRUSH get_sys_color_brush( unsigned int index );
+ extern HPEN get_sys_color_pen( unsigned int index );
+ extern UINT get_system_dpi(void);
++extern UINT get_primary_monitor_dpi(void);
+ extern int get_system_metrics( int index );
+ extern struct ratio get_thread_dpi(void);
+ extern UINT set_thread_dpi_awareness_context( UINT context );

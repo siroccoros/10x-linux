@@ -1,0 +1,636 @@
+--- a/dlls/win32u/freetype.c
++++ b/dlls/win32u/freetype.c
+@@ -152,6 +152,9 @@
+ MAKE_FUNCPTR(FcStrSetCreate);
+ MAKE_FUNCPTR(FcStrSetDestroy);
+ MAKE_FUNCPTR(FcStrSetMember);
++MAKE_FUNCPTR(FcConfigGetCacheDirs);
++MAKE_FUNCPTR(FcConfigGetConfigFiles);
++MAKE_FUNCPTR(FcGetVersion);
+ #ifndef FC_NAMELANG
+ #define FC_NAMELANG "namelang"
+ #endif
+@@ -1079,37 +1082,79 @@
+     return r.ptr == r.end;
+ }
+ 
+-static void face_cache_load(void)
++/* The path of a cache file in the prefix, as ntdll finds the prefix; a
++ * relative one would depend on the cwd. */
++static char *get_cache_file_path( const char *name )
+ {
+-    static const char name[] = "/win32u-fonts.cache";
+     const char *prefix = getenv( "WINEPREFIX" ), *home = getenv( "HOME" );
+-    struct stat st;
+-    char *data;
++    char *path;
+     size_t len;
+-    int fd;
+-
+-    face_cache_loaded = TRUE;
+ 
+-    /* The prefix as ntdll finds it; a relative one would depend on the cwd. */
+     if (prefix && *prefix) home = NULL;
+     else if (home && *home) prefix = NULL;
+-    else return;
+-    len = strlen( prefix ? prefix : home ) + sizeof("/.wine") + sizeof(name);
+-    if ((prefix ? prefix : home)[0] != '/' || !(face_cache_path = malloc( len ))) return;
+-    snprintf( face_cache_path, len, "%s%s%s", prefix ? prefix : home, prefix ? "" : "/.wine", name );
++    else return NULL;
++    len = strlen( prefix ? prefix : home ) + sizeof("/.wine/") + strlen( name );
++    if ((prefix ? prefix : home)[0] != '/' || !(path = malloc( len ))) return NULL;
++    snprintf( path, len, "%s%s/%s", prefix ? prefix : home, prefix ? "" : "/.wine", name );
++    return path;
++}
++
++static char *read_cache_file( const char *path, size_t *size )
++{
++    struct stat st;
++    char *data = NULL;
++    int fd;
+ 
+-    if ((fd = open( face_cache_path, O_RDONLY | O_CLOEXEC )) == -1) return;
++    if ((fd = open( path, O_RDONLY | O_CLOEXEC )) == -1) return NULL;
+     if (!fstat( fd, &st ) && st.st_size > 0 && st.st_size < (64 << 20) &&
+-        (data = malloc( st.st_size )))
++        (data = malloc( st.st_size )) && pread( fd, data, st.st_size, 0 ) != st.st_size)
+     {
+-        if (pread( fd, data, st.st_size, 0 ) != st.st_size || !face_cache_parse( data, st.st_size ))
+-        {
+-            TRACE( "discarding %s\n", debugstr_a(face_cache_path) );
+-            face_cache_clear();
+-        }
+         free( data );
++        data = NULL;
+     }
+     close( fd );
++    *size = data ? st.st_size : 0;
++    return data;
++}
++
++/* Written whole and renamed into place, so readers never see a partial file. */
++static BOOL write_cache_file( const char *path, const void *data, size_t size )
++{
++    size_t len = strlen( path ) + 32;
++    char *tmp_path;
++    BOOL ok = FALSE;
++    int fd;
++
++    if (!(tmp_path = malloc( len ))) return FALSE;
++    snprintf( tmp_path, len, "%s.%d.tmp", path, (int)getpid() );
++    if ((fd = open( tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644 )) != -1)
++    {
++        ok = write( fd, data, size ) == size;
++        if (close( fd )) ok = FALSE;
++        if (!ok || rename( tmp_path, path ))
++        {
++            unlink( tmp_path );
++            ok = FALSE;
++        }
++    }
++    free( tmp_path );
++    return ok;
++}
++
++static void face_cache_load(void)
++{
++    char *data;
++    size_t size;
++
++    face_cache_loaded = TRUE;
++    if (!(face_cache_path = get_cache_file_path( "win32u-fonts.cache" ))) return;
++    if (!(data = read_cache_file( face_cache_path, &size ))) return;
++    if (!face_cache_parse( data, size ))
++    {
++        TRACE( "discarding %s\n", debugstr_a(face_cache_path) );
++        face_cache_clear();
++    }
++    free( data );
+ }
+ 
+ struct face_cache_writer
+@@ -1155,9 +1200,8 @@
+     struct face_cache_entry *entry;
+     UINT magic = FACE_CACHE_MAGIC, version = FACE_CACHE_VERSION, lcid = system_lcid, len, count = 0;
+     size_t count_pos;
+-    char *tmp_path;
+     struct stat st;
+-    int i, j, fd;
++    int i, j;
+ 
+     pthread_mutex_lock( &face_cache_lock );
+     TRACE( "%u faces from the cache, %u parsed\n", face_cache_hits, face_cache_misses );
+@@ -1198,19 +1242,8 @@
+     }
+     if (w.failed) goto done;
+     memcpy( w.data + count_pos, &count, sizeof(count) );
+-
+-    /* Written whole and renamed into place, so readers never see a partial file. */
+-    len = strlen( face_cache_path ) + 32;
+-    if (!(tmp_path = malloc( len ))) goto done;
+-    snprintf( tmp_path, len, "%s.%d.tmp", face_cache_path, (int)getpid() );
+-    if ((fd = open( tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644 )) != -1)
+-    {
+-        BOOL ok = write( fd, w.data, w.size ) == w.size;
+-        if (close( fd )) ok = FALSE;
+-        if (!ok || rename( tmp_path, face_cache_path )) unlink( tmp_path );
+-        else TRACE( "saved %u faces to %s\n", count, debugstr_a(face_cache_path) );
+-    }
+-    free( tmp_path );
++    if (write_cache_file( face_cache_path, w.data, w.size ))
++        TRACE( "saved %u faces to %s\n", count, debugstr_a(face_cache_path) );
+ 
+ done:
+     pthread_mutex_unlock( &face_cache_lock );
+@@ -1610,11 +1643,28 @@
+     return aa_flags;
+ }
+ 
++static pthread_once_t fontconfig_once = PTHREAD_ONCE_INIT;
++static BOOL fontconfig_ready;
++
++static void fontconfig_init_config(void)
++{
++    TRACE( "reading fontconfig's configuration\n" );
++    fontconfig_ready = pFcInit();
++}
++
++/* Read fontconfig's configuration, unless this process already has. */
++static BOOL fontconfig_init(void)
++{
++    pthread_once( &fontconfig_once, fontconfig_init_config );
++    return fontconfig_ready;
++}
++
+ static FcPattern *create_family_pattern( const char *name, FcPattern **cached )
+ {
+     FcPattern *ret = NULL, *tmp, *pattern;
+     FcResult result;
+     if (*cached) return *cached;
++    if (!fontconfig_init()) return NULL;
+     pattern = pFcPatternCreate();
+     pFcPatternAddString( pattern, FC_FAMILY, (const FcChar8 *)name );
+     pFcPatternAddString( pattern, FC_NAMELANG, (const FcChar8 *)"en-us" );
+@@ -1629,51 +1679,388 @@
+     return ret;
+ }
+ 
+-static void fontconfig_add_font( FcPattern *pattern, UINT flags )
++/* What fontconfig tells us about one font, as far as the font list needs it. */
++struct fc_font
+ {
+-    const char *unix_name, *format;
+-    WCHAR *dos_name;
+-    FcBool scalable;
+-    DWORD aa_flags;
+-    int face_index;
+-
+-    TRACE( "(%p %#x)\n", pattern, flags );
++    char *unix_name;
++    UINT  format;        /* FC_FONT_FORMAT_* */
++    BOOL  scalable;
++    UINT  aa_flags;      /* from the font's pattern, 0 if it sets none */
++    int   face_index;
++};
+ 
+-    if (pFcPatternGetString( pattern, FC_FILE, 0, (FcChar8 **)&unix_name ) != FcResultMatch)
+-        return;
++enum { FC_FONT_FORMAT_UNKNOWN, FC_FONT_FORMAT_TYPE1, FC_FONT_FORMAT_OTHER };
+ 
+-    if (pFcPatternGetBool( pattern, FC_SCALABLE, 0, &scalable ) != FcResultMatch)
+-        scalable = FALSE;
++static void fontconfig_add_font_info( const struct fc_font *font, UINT flags )
++{
++    WCHAR *dos_name;
++    DWORD aa_flags;
+ 
+-    if (pFcPatternGetString( pattern, FC_FONTFORMAT, 0, (FcChar8 **)&format ) != FcResultMatch)
++    if (font->format == FC_FONT_FORMAT_UNKNOWN)
+     {
+-        TRACE( "ignoring unknown font format %s\n", debugstr_a(unix_name) );
++        TRACE( "ignoring unknown font format %s\n", debugstr_a(font->unix_name) );
+         return;
+     }
+ 
+-    if (!strcmp( format, "Type 1" ))
++    if (font->format == FC_FONT_FORMAT_TYPE1)
+     {
+-        TRACE( "ignoring Type 1 font %s\n", debugstr_a(unix_name) );
++        TRACE( "ignoring Type 1 font %s\n", debugstr_a(font->unix_name) );
+         return;
+     }
+ 
+-    if (!scalable && !(flags & ADDFONT_ALLOW_BITMAP))
++    if (!font->scalable && !(flags & ADDFONT_ALLOW_BITMAP))
+     {
+-        TRACE( "ignoring non-scalable font %s\n", debugstr_a(unix_name) );
++        TRACE( "ignoring non-scalable font %s\n", debugstr_a(font->unix_name) );
+         return;
+     }
+ 
+-    if (!(aa_flags = parse_aa_pattern( pattern ))) aa_flags = default_aa_flags;
++    if (!(aa_flags = font->aa_flags)) aa_flags = default_aa_flags;
+     flags |= ADDFONT_AA_FLAGS(aa_flags);
+ 
+-    if (pFcPatternGetInteger( pattern, FC_INDEX, 0, &face_index ) != FcResultMatch)
+-        face_index = 0;
+-
+-    ntdll_get_dos_file_name( unix_name, &dos_name, FILE_OPEN );
+-    add_unix_face( unix_name, dos_name, NULL, 0, face_index, flags, NULL );
++    ntdll_get_dos_file_name( font->unix_name, &dos_name, FILE_OPEN );
++    add_unix_face( font->unix_name, dos_name, NULL, 0, font->face_index, flags, NULL );
+     free( dos_name );
+ }
+ 
++/* Fontconfig's part of the font list, kept in a file in the prefix next to the
++ * face cache. Reading fontconfig's configuration costs every process that uses
++ * fonts ~8 ms, yet it rarely changes. The file records the configuration files
++ * fontconfig read and the directories holding them, the font directories,
++ * fontconfig's cache directories and the places a user configuration could
++ * appear (present or not); it is used only while all of these, fontconfig's
++ * version and the environment it reads are unchanged. Fontconfig itself is
++ * then initialized only when it's asked for fallbacks. */
++
++#define FONTCONFIG_CACHE_MAGIC   0x43434657 /* "WFCC" */
++#define FONTCONFIG_CACHE_VERSION 1
++
++struct fc_stamp
++{
++    char *path;
++    BOOL exists;
++    struct face_cache_key key;
++};
++
++static struct fc_font *fc_fonts;
++static UINT fc_fonts_count, fc_fonts_size;
++static struct fc_stamp *fc_stamps;
++static UINT fc_stamps_count, fc_stamps_size;
++static BOOL fc_cache_hit;       /* the font list comes from the cache */
++static BOOL fc_cache_record;    /* collecting a new cache while walking fontconfig */
++static char *fc_cache_path;
++
++static const char * const fc_cache_env[] =
++{
++    "FONTCONFIG_FILE", "FONTCONFIG_PATH", "FONTCONFIG_SYSROOT", "HOME", "XDG_CONFIG_HOME",
++    "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_DATA_DIRS", "FC_LANG", "LANGUAGE", "LANG",
++    "LC_ALL", "LC_CTYPE",
++};
++
++static void fc_cache_free(void)
++{
++    UINT i;
++
++    for (i = 0; i < fc_fonts_count; i++) free( fc_fonts[i].unix_name );
++    for (i = 0; i < fc_stamps_count; i++) free( fc_stamps[i].path );
++    free( fc_fonts );
++    free( fc_stamps );
++    fc_fonts = NULL;
++    fc_stamps = NULL;
++    fc_fonts_count = fc_fonts_size = fc_stamps_count = fc_stamps_size = 0;
++}
++
++static void fc_cache_stat( struct fc_stamp *stamp )
++{
++    struct stat st;
++
++    memset( &stamp->key, 0, sizeof(stamp->key) );
++    if ((stamp->exists = !stat( stamp->path, &st ))) face_cache_set_key( &stamp->key, &st );
++}
++
++static void fc_cache_add_stamp( const char *path, size_t len )
++{
++    struct fc_stamp *stamp;
++    UINT i;
++
++    if (!fc_cache_record) return;
++    for (i = 0; i < fc_stamps_count; i++)
++        if (!strncmp( fc_stamps[i].path, path, len ) && !fc_stamps[i].path[len]) return;
++    if (fc_stamps_count == fc_stamps_size)
++    {
++        UINT size = max( 64, fc_stamps_size * 2 );
++        if (!(stamp = realloc( fc_stamps, size * sizeof(*stamp) ))) goto failed;
++        fc_stamps = stamp;
++        fc_stamps_size = size;
++    }
++    stamp = &fc_stamps[fc_stamps_count];
++    if (!(stamp->path = strndup( path, len ))) goto failed;
++    fc_cache_stat( stamp );
++    fc_stamps_count++;
++    return;
++
++failed:
++    fc_cache_record = FALSE;
++}
++
++static void fc_cache_add_path( const char *path )
++{
++    fc_cache_add_stamp( path, strlen( path ) );
++}
++
++/* A file, and the directory holding it, which changes when files are added. */
++static void fc_cache_add_file( const char *path )
++{
++    const char *p = strrchr( path, '/' );
++
++    fc_cache_add_path( path );
++    if (p) fc_cache_add_stamp( path, p > path ? p - path : 1 );
++}
++
++static void fc_cache_add_font( const struct fc_font *info )
++{
++    struct fc_font *font;
++
++    if (!fc_cache_record) return;
++    if (fc_fonts_count == fc_fonts_size)
++    {
++        UINT size = max( 1024, fc_fonts_size * 2 );
++        if (!(font = realloc( fc_fonts, size * sizeof(*font) ))) goto failed;
++        fc_fonts = font;
++        fc_fonts_size = size;
++    }
++    font = &fc_fonts[fc_fonts_count];
++    *font = *info;
++    if (!(font->unix_name = strdup( info->unix_name ))) goto failed;
++    fc_fonts_count++;
++    return;
++
++failed:
++    fc_cache_record = FALSE;
++}
++
++static void fc_cache_write_string( struct face_cache_writer *w, const char *str )
++{
++    UINT len = strlen( str );
++
++    face_cache_write( w, &len, sizeof(len) );
++    face_cache_write( w, str, len );
++}
++
++static BOOL fc_cache_read_string( struct face_cache_reader *r, char **str )
++{
++    UINT len;
++
++    *str = NULL;
++    if (!face_cache_read( r, &len, sizeof(len) ) || len > 65536) return FALSE;
++    if (!(*str = malloc( len + 1 ))) return FALSE;
++    if (!face_cache_read( r, *str, len )) return FALSE;
++    (*str)[len] = 0;
++    return strlen( *str ) == len;
++}
++
++/* The environment fontconfig reads, and its version, as one string. */
++static char *fc_cache_get_env(void)
++{
++    struct face_cache_writer w = { 0 };
++    char version[16], nul = 0;
++    const char *value;
++    UINT i;
++
++    snprintf( version, sizeof(version), "%d\n", pFcGetVersion() );
++    face_cache_write( &w, version, strlen( version ) );
++    for (i = 0; i < ARRAY_SIZE(fc_cache_env); i++)
++    {
++        if (!(value = getenv( fc_cache_env[i] ))) continue;
++        face_cache_write( &w, fc_cache_env[i], strlen( fc_cache_env[i] ) );
++        face_cache_write( &w, "=", 1 );
++        face_cache_write( &w, value, strlen( value ) );
++        face_cache_write( &w, "\n", 1 );
++    }
++    face_cache_write( &w, &nul, 1 );
++    if (!w.failed) return w.data;
++    free( w.data );
++    return NULL;
++}
++
++static BOOL fc_cache_parse( const char *data, size_t size, const char *env )
++{
++    struct face_cache_reader r = { data, data + size };
++    UINT magic, version, count, i;
++    char *str;
++    BOOL ret;
++
++    if (!face_cache_read( &r, &magic, sizeof(magic) ) || magic != FONTCONFIG_CACHE_MAGIC) return FALSE;
++    if (!face_cache_read( &r, &version, sizeof(version) ) || version != FONTCONFIG_CACHE_VERSION) return FALSE;
++    ret = fc_cache_read_string( &r, &str ) && !strcmp( str, PACKAGE_VERSION );
++    free( str );
++    if (!ret) return FALSE;
++    ret = fc_cache_read_string( &r, &str ) && !strcmp( str, env );
++    free( str );
++    if (!ret) return FALSE;
++    if (!face_cache_read( &r, &default_aa_flags, sizeof(default_aa_flags) )) return FALSE;
++
++    if (!face_cache_read( &r, &count, sizeof(count) ) || count > 65536) return FALSE;
++    if (!(fc_stamps = calloc( count, sizeof(*fc_stamps) ))) return FALSE;
++    fc_stamps_size = count;
++    for (i = 0; i < count; i++)
++    {
++        struct fc_stamp *stamp = &fc_stamps[fc_stamps_count], now;
++
++        if (!fc_cache_read_string( &r, &stamp->path ))
++        {
++            free( stamp->path );
++            return FALSE;
++        }
++        fc_stamps_count++;
++        if (!face_cache_read( &r, &stamp->exists, sizeof(stamp->exists) ) ||
++            !face_cache_read( &r, &stamp->key, sizeof(stamp->key) )) return FALSE;
++        now.path = stamp->path;
++        fc_cache_stat( &now );
++        if (now.exists != stamp->exists || memcmp( &now.key, &stamp->key, sizeof(now.key) ))
++        {
++            TRACE( "%s changed\n", debugstr_a(stamp->path) );
++            return FALSE;
++        }
++    }
++
++    if (!face_cache_read( &r, &count, sizeof(count) ) || count > (1 << 20)) return FALSE;
++    if (!(fc_fonts = calloc( count, sizeof(*fc_fonts) ))) return FALSE;
++    fc_fonts_size = count;
++    for (i = 0; i < count; i++)
++    {
++        struct fc_font *font = &fc_fonts[fc_fonts_count];
++
++        if (!fc_cache_read_string( &r, &font->unix_name ))
++        {
++            free( font->unix_name );
++            return FALSE;
++        }
++        fc_fonts_count++;
++        if (!face_cache_read( &r, &font->format, sizeof(font->format) ) ||
++            !face_cache_read( &r, &font->scalable, sizeof(font->scalable) ) ||
++            !face_cache_read( &r, &font->aa_flags, sizeof(font->aa_flags) ) ||
++            !face_cache_read( &r, &font->face_index, sizeof(font->face_index) )) return FALSE;
++    }
++    return r.ptr == r.end;
++}
++
++static BOOL fc_cache_load(void)
++{
++    char *data, *env;
++    size_t size;
++    BOOL ret = FALSE;
++
++    if (!pFcGetVersion || !pFcConfigGetConfigFiles || !pFcConfigGetCacheDirs) return FALSE;
++    if (!(fc_cache_path = get_cache_file_path( "win32u-fontconfig.cache" ))) return FALSE;
++    if (!(env = fc_cache_get_env())) return FALSE;
++    if ((data = read_cache_file( fc_cache_path, &size )))
++    {
++        ret = fc_cache_parse( data, size, env );
++        free( data );
++    }
++    free( env );
++    if (!ret) fc_cache_free();
++    fc_cache_record = !ret;
++    TRACE( "%s %s\n", ret ? "using" : "not using", debugstr_a(fc_cache_path) );
++    return ret;
++}
++
++static void fc_cache_save( FcConfig *config )
++{
++    struct face_cache_writer w = { 0 };
++    UINT magic = FONTCONFIG_CACHE_MAGIC, version = FONTCONFIG_CACHE_VERSION, i;
++    const char *xdg = getenv( "XDG_CONFIG_HOME" ), *home = getenv( "HOME" );
++    const FcChar8 *path;
++    FcStrList *list;
++    char *env, buf[4096];
++
++    if (!fc_cache_record) goto done;
++
++    if ((list = pFcConfigGetConfigFiles( config )))
++    {
++        while ((path = pFcStrListNext( list ))) fc_cache_add_file( (const char *)path );
++        pFcStrListDone( list );
++    }
++    if ((list = pFcConfigGetCacheDirs( config )))
++    {
++        while ((path = pFcStrListNext( list ))) fc_cache_add_path( (const char *)path );
++        pFcStrListDone( list );
++    }
++    /* user configuration that may not exist yet */
++    if (xdg && *xdg) snprintf( buf, sizeof(buf), "%s/fontconfig", xdg );
++    else if (home && *home) snprintf( buf, sizeof(buf), "%s/.config/fontconfig", home );
++    else buf[0] = 0;
++    if (buf[0])
++    {
++        fc_cache_add_path( buf );
++        strncat( buf, "/conf.d", sizeof(buf) - strlen( buf ) - 1 );
++        fc_cache_add_path( buf );
++    }
++    if (home && *home)
++    {
++        snprintf( buf, sizeof(buf), "%s/.fonts.conf", home );
++        fc_cache_add_path( buf );
++        snprintf( buf, sizeof(buf), "%s/.fonts.conf.d", home );
++        fc_cache_add_path( buf );
++    }
++    if (!fc_cache_record || !(env = fc_cache_get_env())) goto done;
++
++    face_cache_write( &w, &magic, sizeof(magic) );
++    face_cache_write( &w, &version, sizeof(version) );
++    fc_cache_write_string( &w, PACKAGE_VERSION );
++    fc_cache_write_string( &w, env );
++    free( env );
++    face_cache_write( &w, &default_aa_flags, sizeof(default_aa_flags) );
++    face_cache_write( &w, &fc_stamps_count, sizeof(fc_stamps_count) );
++    for (i = 0; i < fc_stamps_count; i++)
++    {
++        fc_cache_write_string( &w, fc_stamps[i].path );
++        face_cache_write( &w, &fc_stamps[i].exists, sizeof(fc_stamps[i].exists) );
++        face_cache_write( &w, &fc_stamps[i].key, sizeof(fc_stamps[i].key) );
++    }
++    face_cache_write( &w, &fc_fonts_count, sizeof(fc_fonts_count) );
++    for (i = 0; i < fc_fonts_count; i++)
++    {
++        fc_cache_write_string( &w, fc_fonts[i].unix_name );
++        face_cache_write( &w, &fc_fonts[i].format, sizeof(fc_fonts[i].format) );
++        face_cache_write( &w, &fc_fonts[i].scalable, sizeof(fc_fonts[i].scalable) );
++        face_cache_write( &w, &fc_fonts[i].aa_flags, sizeof(fc_fonts[i].aa_flags) );
++        face_cache_write( &w, &fc_fonts[i].face_index, sizeof(fc_fonts[i].face_index) );
++    }
++    if (!w.failed && write_cache_file( fc_cache_path, w.data, w.size ))
++        TRACE( "saved %u fonts, %u stamps to %s\n", fc_fonts_count, fc_stamps_count,
++               debugstr_a(fc_cache_path) );
++
++done:
++    free( w.data );
++    fc_cache_record = FALSE;
++    fc_cache_free();
++}
++
++static void fontconfig_add_font( FcPattern *pattern, UINT flags )
++{
++    struct fc_font font = { 0 };
++    const char *format;
++    FcBool scalable;
++
++    TRACE( "(%p %#x)\n", pattern, flags );
++
++    if (pFcPatternGetString( pattern, FC_FILE, 0, (FcChar8 **)&font.unix_name ) != FcResultMatch)
++        return;
++    if (pFcPatternGetString( pattern, FC_FONTFORMAT, 0, (FcChar8 **)&format ) != FcResultMatch)
++        font.format = FC_FONT_FORMAT_UNKNOWN;
++    else
++        font.format = strcmp( format, "Type 1" ) ? FC_FONT_FORMAT_OTHER : FC_FONT_FORMAT_TYPE1;
++    if (pFcPatternGetBool( pattern, FC_SCALABLE, 0, &scalable ) != FcResultMatch) scalable = FALSE;
++    font.scalable = scalable;
++    font.aa_flags = parse_aa_pattern( pattern );
++    if (pFcPatternGetInteger( pattern, FC_INDEX, 0, &font.face_index ) != FcResultMatch)
++        font.face_index = 0;
++
++    fc_cache_add_font( &font );
++    fontconfig_add_font_info( &font, flags );
++}
++
+ static void init_fontconfig(void)
+ {
+     void *fc_handle = dlopen(SONAME_LIBFONTCONFIG, RTLD_NOW);
+@@ -1712,8 +2099,19 @@
+     LOAD_FUNCPTR(FcStrSetDestroy);
+     LOAD_FUNCPTR(FcStrSetMember);
+ #undef LOAD_FUNCPTR
++    pFcConfigGetCacheDirs = dlsym( fc_handle, "FcConfigGetCacheDirs" );
++    pFcConfigGetConfigFiles = dlsym( fc_handle, "FcConfigGetConfigFiles" );
++    pFcGetVersion = dlsym( fc_handle, "FcGetVersion" );
+ 
+-    if (pFcInit())
++    if (fc_cache_load())
++    {
++        TRACE( "enabled from the cache, default flags = %x\n", default_aa_flags );
++        fc_cache_hit = TRUE;
++        fontconfig_enabled = TRUE;
++        return;
++    }
++
++    if (fontconfig_init())
+     {
+         FcPattern *pattern = pFcPatternCreate();
+         pFcConfigSubstitute( NULL, pattern, FcMatchFont );
+@@ -1749,6 +2147,7 @@
+         if (pFcStrSetMember( done_set, dir )) continue;
+ 
+         TRACE( "adding fonts from %s\n", dir );
++        fc_cache_add_path( (const char *)dir );
+         if (!(cache = pFcDirCacheRead( dir, FcFalse, config ))) continue;
+ 
+         if (!(font_set = pFcCacheCopySet( cache ))) goto done;
+@@ -1785,11 +2184,20 @@
+     FcConfig *config;
+ 
+     if (!fontconfig_enabled) return;
++    if (fc_cache_hit)
++    {
++        UINT i;
++
++        for (i = 0; i < fc_fonts_count; i++) fontconfig_add_font_info( &fc_fonts[i], ADDFONT_EXTERNAL_FONT );
++        fc_cache_free();
++        return;
++    }
+     if (!(config = pFcConfigGetCurrent())) goto done;
+     if (!(done_set = pFcStrSetCreate())) goto done;
+     if (!(dir_list = pFcConfigGetFontDirs( config ))) goto done;
+ 
+     fontconfig_add_fonts_from_dir_list( config, dir_list, done_set, ADDFONT_EXTERNAL_FONT );
++    fc_cache_save( config );
+ 
+ done:
+     if (dir_list) pFcStrListDone( dir_list );

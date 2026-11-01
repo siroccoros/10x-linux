@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Set up 10x for this user: a Wine prefix with what 10x needs (each piece
+# pinned by this package), then 10x itself from your installer.
+#
+#   10x-setup PATH/TO/10xInstaller.exe
+set -euo pipefail
+
+installer_sha256=048ed5ebb999b95be039254250a28f31caf2d04d0620039dab7248c19db9aa6f  # 10x 1.0.565.0
+exe_sha256=6d847a272d395c2858771f86abff86a5e869750e95772769c5996d07288dc6e9        # its 10x.exe
+
+wine_bin=/opt/10x-linux/wine/bin
+share=/usr/share/10x-linux
+data="${XDG_DATA_HOME:-$HOME/.local/share}"
+prefix="$data/wineprefixes/10x"
+
+die() { echo "10x-setup: $*" >&2; exit 1; }
+step() { echo "==> $*"; }
+
+[[ $# == 1 && -f "$1" ]] || die "usage: 10x-setup PATH/TO/10xInstaller.exe"
+installer=$(realpath -- "$1")
+[[ "$(sha256sum < "$installer")" == "$installer_sha256 "* ]] ||
+    die "$1 isn't the installer of 10x 1.0.565 (sha256 $installer_sha256)."
+[[ ! -e "$prefix" ]] || die "$prefix already exists; move it away to set up from scratch."
+
+export WINEPREFIX="$prefix" WINEARCH=win64 WINEDEBUG=-all PATH="$wine_bin:$PATH"
+# Built without a display: nothing flashes on screen, and nothing waits on a
+# dialog.
+unset DISPLAY WAYLAND_DISPLAY
+export WINEDLLOVERRIDES="winemenubuilder.exe=d"
+winetricks() { "$share/winetricks" -q --unattended "$@"; }
+override() { wine reg add 'HKCU\Software\Wine\DllOverrides' /v "$1" /d "$2" /f > /dev/null; }
+
+step "Creating the Wine prefix"
+# No Mono or Gecko: 10x uses .NET Framework (below) and no web views.
+WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" wineboot -i
+wineserver -w
+override mshtml ''
+override winemenubuilder.exe ''
+wine reg add 'HKCU\Software\Wine\Drivers' /v Graphics /d wayland,x11 /f > /dev/null
+
+step ".NET Framework 4.8"
+winetricks dotnet48
+winetricks win10
+
+step "10x"
+wine "$installer" /quiet /norestart
+wineserver -w
+[[ "$(sha256sum < "$prefix/drive_c/Program Files/PureDevSoftware/10x/10x.exe")" == "$exe_sha256 "* ]] ||
+    die "the installer didn't install the expected 10x.exe."
+# 10x ships Microsoft's C++ runtime; use it over Wine's.
+for dll in msvcp140 msvcp140_1 msvcp140_2 vcruntime140 vcruntime140_1 concrt140; do
+    override "$dll" native,builtin
+done
+
+step "Fonts and the Direct3D shader compiler"
+winetricks d3dcompiler_47 corefonts consolas tahoma fontsmooth=rgb
+# 10x looks for Segoe UI and Calibri Light files by family name; open
+# metric-compatible fonts, renamed.
+python3 -I "$share/make-fonts.py" "$share/fonts/selawik" "$share/fonts/carlito" "$prefix/drive_c/windows/Fonts"
+
+step "DXVK (Direct3D on Vulkan)"
+cp "$share"/dxvk/x64/*.dll "$prefix/drive_c/windows/system32/"
+cp "$share"/dxvk/x32/*.dll "$prefix/drive_c/windows/syswow64/"
+for dll in d3d8 d3d9 d3d10core d3d11 dxgi; do override "*$dll" native; done
+wineserver -w
+
+step "Menu entry"
+python3 -I "$share/extract-icon.py" "$prefix/drive_c/Program Files/PureDevSoftware/10x/10x.exe" \
+    "$data/icons/hicolor" 10x-editor
+touch "$data/icons/hicolor"
+install -Dm644 "$share/com.puredevsoftware.Editor10x.desktop" \
+    "$data/applications/com.puredevsoftware.Editor10x.desktop"
+update-desktop-database "$data/applications" 2>/dev/null || true
+
+step "Keeping the prefix booted (10x-prewarm.service)"
+systemctl --user enable --now 10x-prewarm.service
+
+echo "Done. Open 10x from your app launcher, or run: 10x [files...]"

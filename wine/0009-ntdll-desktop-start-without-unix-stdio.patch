@@ -1,0 +1,25 @@
+--- a/dlls/ntdll/unix/env.c
++++ b/dlls/ntdll/unix/env.c
+@@ -357,6 +357,7 @@
+             STARTS_WITH( var, "SDL_VIDEODRIVER=" ) ||
+             STARTS_WITH( var, "SDL_VIDEO_DRIVER=" ) ||
+             STARTS_WITH( var, "WAYLAND_DISPLAY=" ) ||
++            STARTS_WITH( var, "WINEDESKTOPSTART=" ) ||
+             STARTS_WITH( var, "VK_" ));
+ }
+ 
+@@ -1343,6 +1344,14 @@
+ {
+     int output_fd = -1;
+ 
++    /* Started from the desktop, as Explorer starts programs: the standard
++     * Unix fds are only where Wine logs to, and not the program's. */
++    if (getenv( "WINEDESKTOPSTART" ))
++    {
++        unsetenv( "WINEDESKTOPSTART" );
++        return;
++    }
++
+     wine_server_fd_to_handle( 0, GENERIC_READ|SYNCHRONIZE,  OBJ_INHERIT, &params->hStdInput );
+     wine_server_fd_to_handle( 1, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, &params->hStdOutput );
+     wine_server_fd_to_handle( 2, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, &params->hStdError );

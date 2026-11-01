@@ -1,0 +1,503 @@
+--- a/dlls/win32u/font.c
++++ b/dlls/win32u/font.c
+@@ -6783,6 +6783,7 @@
+     load_gdi_font_subst();
+     load_gdi_font_replacements();
+     load_system_links();
++    font_funcs->fonts_loaded();
+     dump_gdi_font_list();
+     dump_gdi_font_subst();
+     return dpi;
+--- a/dlls/win32u/freetype.c
++++ b/dlls/win32u/freetype.c
+@@ -885,9 +885,440 @@
+     struct bitmap_font_size size;
+ };
+ 
++/* Parsed font file names and properties, kept in a file in the prefix and
++ * shared by its processes. Without it every process that loads win32u opens
++ * and parses each installed font file at startup (~40 ms for 1100 fonts),
++ * work that Windows does once. An entry is used only while the file's device,
++ * inode, size, mtime and ctime are unchanged; any other difference (Wine
++ * version, system locale, a damaged file) discards the whole cache. */
++
++#define FACE_CACHE_MAGIC   0x43464657 /* "WFFC" */
++#define FACE_CACHE_VERSION 1
++#define FACE_CACHE_BUCKETS 4096
++
++struct face_cache_key
++{
++    UINT64 dev, ino, size;
++    UINT64 mtime_sec, mtime_nsec, ctime_sec, ctime_nsec;
++};
++
++struct face_cache_entry
++{
++    struct face_cache_entry *next;
++    struct face_cache_key key;
++    UINT face_index;
++    UINT allow_bitmap;
++    BOOL used;                /* looked up or parsed by this process */
++    BOOL valid;               /* FALSE if the face couldn't be parsed */
++    BOOL scalable;
++    UINT num_faces;
++    DWORD ntm_flags;
++    UINT weight;
++    DWORD font_version;
++    FONTSIGNATURE fs;
++    struct bitmap_font_size size;
++    WCHAR *names[4];          /* family, second, style, full; may be NULL */
++    char path[1];
++};
++
++static pthread_mutex_t face_cache_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct face_cache_entry *face_cache[FACE_CACHE_BUCKETS];
++static BOOL face_cache_loaded, face_cache_dirty;
++static UINT face_cache_hits, face_cache_misses;
++static char *face_cache_path;
++
++static void face_cache_set_key( struct face_cache_key *key, const struct stat *st )
++{
++    key->dev = st->st_dev;
++    key->ino = st->st_ino;
++    key->size = st->st_size;
++    key->mtime_sec = st->st_mtim.tv_sec;
++    key->mtime_nsec = st->st_mtim.tv_nsec;
++    key->ctime_sec = st->st_ctim.tv_sec;
++    key->ctime_nsec = st->st_ctim.tv_nsec;
++}
++
++static UINT face_cache_hash( const char *path, UINT face_index, UINT allow_bitmap )
++{
++    UINT hash = 2166136261u;
++    while (*path) hash = (hash ^ (unsigned char)*path++) * 16777619u;
++    hash = (hash ^ face_index) * 16777619u;
++    hash = (hash ^ allow_bitmap) * 16777619u;
++    return hash % FACE_CACHE_BUCKETS;
++}
++
++static struct face_cache_entry *face_cache_find( const char *path, UINT face_index, UINT allow_bitmap )
++{
++    struct face_cache_entry *entry = face_cache[face_cache_hash( path, face_index, allow_bitmap )];
++
++    for (; entry; entry = entry->next)
++        if (entry->face_index == face_index && entry->allow_bitmap == allow_bitmap &&
++            !strcmp( entry->path, path )) return entry;
++    return NULL;
++}
++
++static void face_cache_free_names( struct face_cache_entry *entry )
++{
++    int i;
++    for (i = 0; i < ARRAY_SIZE(entry->names); i++)
++    {
++        free( entry->names[i] );
++        entry->names[i] = NULL;
++    }
++}
++
++static struct face_cache_entry *face_cache_add( const char *path, UINT face_index, UINT allow_bitmap )
++{
++    UINT hash = face_cache_hash( path, face_index, allow_bitmap );
++    size_t len = strlen( path );
++    struct face_cache_entry *entry;
++
++    if (!(entry = calloc( 1, offsetof( struct face_cache_entry, path[len + 1] ) ))) return NULL;
++    memcpy( entry->path, path, len + 1 );
++    entry->face_index = face_index;
++    entry->allow_bitmap = allow_bitmap;
++    entry->next = face_cache[hash];
++    face_cache[hash] = entry;
++    return entry;
++}
++
++static void face_cache_clear(void)
++{
++    struct face_cache_entry *entry, *next;
++    int i;
++
++    for (i = 0; i < FACE_CACHE_BUCKETS; i++)
++    {
++        for (entry = face_cache[i]; entry; entry = next)
++        {
++            next = entry->next;
++            face_cache_free_names( entry );
++            free( entry );
++        }
++        face_cache[i] = NULL;
++    }
++}
++
++struct face_cache_reader
++{
++    const char *ptr, *end;
++};
++
++static BOOL face_cache_read( struct face_cache_reader *r, void *buf, size_t size )
++{
++    if (r->end - r->ptr < size) return FALSE;
++    memcpy( buf, r->ptr, size );
++    r->ptr += size;
++    return TRUE;
++}
++
++static BOOL face_cache_read_name( struct face_cache_reader *r, WCHAR **name )
++{
++    UINT len;
++
++    *name = NULL;
++    if (!face_cache_read( r, &len, sizeof(len) )) return FALSE;
++    if (len == ~0u) return TRUE;
++    if (len > 4096 || !(*name = malloc( (len + 1) * sizeof(WCHAR) ))) return FALSE;
++    if (!face_cache_read( r, *name, len * sizeof(WCHAR) )) return FALSE;
++    (*name)[len] = 0;
++    return TRUE;
++}
++
++static BOOL face_cache_parse( const char *data, size_t size )
++{
++    struct face_cache_reader r = { data, data + size };
++    UINT magic, version, lcid, len, count, i, j;
++    char wine_version[64];
++
++    if (!face_cache_read( &r, &magic, sizeof(magic) ) || magic != FACE_CACHE_MAGIC) return FALSE;
++    if (!face_cache_read( &r, &version, sizeof(version) ) || version != FACE_CACHE_VERSION) return FALSE;
++    if (!face_cache_read( &r, &lcid, sizeof(lcid) ) || lcid != system_lcid) return FALSE;
++    if (!face_cache_read( &r, &len, sizeof(len) ) || len >= sizeof(wine_version)) return FALSE;
++    if (!face_cache_read( &r, wine_version, len )) return FALSE;
++    wine_version[len] = 0;
++    if (strcmp( wine_version, PACKAGE_VERSION )) return FALSE;
++    if (!face_cache_read( &r, &count, sizeof(count) )) return FALSE;
++
++    for (i = 0; i < count; i++)
++    {
++        struct face_cache_entry tmp, *entry;
++        char path[4096];
++
++        memset( &tmp, 0, sizeof(tmp) );
++        if (!face_cache_read( &r, &len, sizeof(len) ) || !len || len >= sizeof(path)) return FALSE;
++        if (!face_cache_read( &r, path, len )) return FALSE;
++        path[len] = 0;
++        if (strlen( path ) != len) return FALSE;
++        if (!face_cache_read( &r, &tmp.key, sizeof(tmp.key) ) ||
++            !face_cache_read( &r, &tmp.face_index, sizeof(tmp.face_index) ) ||
++            !face_cache_read( &r, &tmp.allow_bitmap, sizeof(tmp.allow_bitmap) ) ||
++            !face_cache_read( &r, &tmp.valid, sizeof(tmp.valid) ) ||
++            !face_cache_read( &r, &tmp.scalable, sizeof(tmp.scalable) ) ||
++            !face_cache_read( &r, &tmp.num_faces, sizeof(tmp.num_faces) ) ||
++            !face_cache_read( &r, &tmp.ntm_flags, sizeof(tmp.ntm_flags) ) ||
++            !face_cache_read( &r, &tmp.weight, sizeof(tmp.weight) ) ||
++            !face_cache_read( &r, &tmp.font_version, sizeof(tmp.font_version) ) ||
++            !face_cache_read( &r, &tmp.fs, sizeof(tmp.fs) ) ||
++            !face_cache_read( &r, &tmp.size, sizeof(tmp.size) ))
++            return FALSE;
++        if (face_cache_find( path, tmp.face_index, tmp.allow_bitmap )) return FALSE;
++        if (!(entry = face_cache_add( path, tmp.face_index, tmp.allow_bitmap ))) return FALSE;
++        entry->key = tmp.key;
++        entry->valid = tmp.valid;
++        entry->scalable = tmp.scalable;
++        entry->num_faces = tmp.num_faces;
++        entry->ntm_flags = tmp.ntm_flags;
++        entry->weight = tmp.weight;
++        entry->font_version = tmp.font_version;
++        entry->fs = tmp.fs;
++        entry->size = tmp.size;
++        for (j = 0; j < ARRAY_SIZE(entry->names); j++)
++            if (!face_cache_read_name( &r, &entry->names[j] )) return FALSE;
++    }
++    return r.ptr == r.end;
++}
++
++static void face_cache_load(void)
++{
++    static const char name[] = "/win32u-fonts.cache";
++    const char *prefix = getenv( "WINEPREFIX" ), *home = getenv( "HOME" );
++    struct stat st;
++    char *data;
++    size_t len;
++    int fd;
++
++    face_cache_loaded = TRUE;
++
++    /* The prefix as ntdll finds it; a relative one would depend on the cwd. */
++    if (prefix && *prefix) home = NULL;
++    else if (home && *home) prefix = NULL;
++    else return;
++    len = strlen( prefix ? prefix : home ) + sizeof("/.wine") + sizeof(name);
++    if ((prefix ? prefix : home)[0] != '/' || !(face_cache_path = malloc( len ))) return;
++    snprintf( face_cache_path, len, "%s%s%s", prefix ? prefix : home, prefix ? "" : "/.wine", name );
++
++    if ((fd = open( face_cache_path, O_RDONLY | O_CLOEXEC )) == -1) return;
++    if (!fstat( fd, &st ) && st.st_size > 0 && st.st_size < (64 << 20) &&
++        (data = malloc( st.st_size )))
++    {
++        if (pread( fd, data, st.st_size, 0 ) != st.st_size || !face_cache_parse( data, st.st_size ))
++        {
++            TRACE( "discarding %s\n", debugstr_a(face_cache_path) );
++            face_cache_clear();
++        }
++        free( data );
++    }
++    close( fd );
++}
++
++struct face_cache_writer
++{
++    char *data;
++    size_t size, capacity;
++    BOOL failed;
++};
++
++static void face_cache_write( struct face_cache_writer *w, const void *buf, size_t size )
++{
++    if (w->failed) return;
++    if (w->capacity - w->size < size)
++    {
++        size_t capacity = max( w->capacity * 2, w->size + size + 65536 );
++        char *data = realloc( w->data, capacity );
++        if (!data)
++        {
++            w->failed = TRUE;
++            return;
++        }
++        w->data = data;
++        w->capacity = capacity;
++    }
++    memcpy( w->data + w->size, buf, size );
++    w->size += size;
++}
++
++static void face_cache_write_name( struct face_cache_writer *w, const WCHAR *name )
++{
++    UINT len = name ? lstrlenW( name ) : ~0u;
++
++    face_cache_write( w, &len, sizeof(len) );
++    if (name) face_cache_write( w, name, len * sizeof(WCHAR) );
++}
++
++/* Save the cache if this process parsed anything. Entries for files that no
++ * longer exist are dropped; everything else is kept, since other programs may
++ * load fonts this one didn't. */
++static void face_cache_flush(void)
++{
++    struct face_cache_writer w = { 0 };
++    struct face_cache_entry *entry;
++    UINT magic = FACE_CACHE_MAGIC, version = FACE_CACHE_VERSION, lcid = system_lcid, len, count = 0;
++    size_t count_pos;
++    char *tmp_path;
++    struct stat st;
++    int i, j, fd;
++
++    pthread_mutex_lock( &face_cache_lock );
++    TRACE( "%u faces from the cache, %u parsed\n", face_cache_hits, face_cache_misses );
++    if (!face_cache_dirty || !face_cache_path) goto done;
++    face_cache_dirty = FALSE;
++
++    face_cache_write( &w, &magic, sizeof(magic) );
++    face_cache_write( &w, &version, sizeof(version) );
++    face_cache_write( &w, &lcid, sizeof(lcid) );
++    len = strlen( PACKAGE_VERSION );
++    face_cache_write( &w, &len, sizeof(len) );
++    face_cache_write( &w, PACKAGE_VERSION, len );
++    count_pos = w.size;
++    face_cache_write( &w, &count, sizeof(count) );
++
++    for (i = 0; i < FACE_CACHE_BUCKETS; i++)
++    {
++        for (entry = face_cache[i]; entry; entry = entry->next)
++        {
++            if (!entry->used && stat( entry->path, &st )) continue;
++            len = strlen( entry->path );
++            face_cache_write( &w, &len, sizeof(len) );
++            face_cache_write( &w, entry->path, len );
++            face_cache_write( &w, &entry->key, sizeof(entry->key) );
++            face_cache_write( &w, &entry->face_index, sizeof(entry->face_index) );
++            face_cache_write( &w, &entry->allow_bitmap, sizeof(entry->allow_bitmap) );
++            face_cache_write( &w, &entry->valid, sizeof(entry->valid) );
++            face_cache_write( &w, &entry->scalable, sizeof(entry->scalable) );
++            face_cache_write( &w, &entry->num_faces, sizeof(entry->num_faces) );
++            face_cache_write( &w, &entry->ntm_flags, sizeof(entry->ntm_flags) );
++            face_cache_write( &w, &entry->weight, sizeof(entry->weight) );
++            face_cache_write( &w, &entry->font_version, sizeof(entry->font_version) );
++            face_cache_write( &w, &entry->fs, sizeof(entry->fs) );
++            face_cache_write( &w, &entry->size, sizeof(entry->size) );
++            for (j = 0; j < ARRAY_SIZE(entry->names); j++) face_cache_write_name( &w, entry->names[j] );
++            count++;
++        }
++    }
++    if (w.failed) goto done;
++    memcpy( w.data + count_pos, &count, sizeof(count) );
++
++    /* Written whole and renamed into place, so readers never see a partial file. */
++    len = strlen( face_cache_path ) + 32;
++    if (!(tmp_path = malloc( len ))) goto done;
++    snprintf( tmp_path, len, "%s.%d.tmp", face_cache_path, (int)getpid() );
++    if ((fd = open( tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644 )) != -1)
++    {
++        BOOL ok = write( fd, w.data, w.size ) == w.size;
++        if (close( fd )) ok = FALSE;
++        if (!ok || rename( tmp_path, face_cache_path )) unlink( tmp_path );
++        else TRACE( "saved %u faces to %s\n", count, debugstr_a(face_cache_path) );
++    }
++    free( tmp_path );
++
++done:
++    pthread_mutex_unlock( &face_cache_lock );
++    free( w.data );
++}
++
++static struct unix_face *unix_face_create_uncached( const char *unix_name, void *data_ptr, UINT data_size,
++                                                    UINT face_index, UINT flags, struct stat *file_st );
++
++static WCHAR *face_cache_dup_name( const WCHAR *name )
++{
++    return name ? wcsdup( name ) : NULL;
++}
++
+ static struct unix_face *unix_face_create( const char *unix_name, void *data_ptr, UINT data_size,
+                                            UINT face_index, UINT flags )
+ {
++    UINT allow_bitmap = !!(flags & ADDFONT_ALLOW_BITMAP);
++    struct face_cache_entry *entry;
++    struct face_cache_key key;
++    struct unix_face *This;
++    WCHAR *names[4] = { 0 };
++    struct stat st;
++    int i;
++
++    if (!unix_name) return unix_face_create_uncached( NULL, data_ptr, data_size, face_index, flags, NULL );
++    if (stat( unix_name, &st )) return NULL;
++    face_cache_set_key( &key, &st );
++
++    pthread_mutex_lock( &face_cache_lock );
++    if (!face_cache_loaded) face_cache_load();
++    if ((entry = face_cache_find( unix_name, face_index, allow_bitmap )) &&
++        !memcmp( &entry->key, &key, sizeof(key) ))
++    {
++        entry->used = TRUE;
++        face_cache_hits++;
++        This = NULL;
++        if (entry->valid && (This = calloc( 1, sizeof(*This) )))
++        {
++            This->scalable = entry->scalable;
++            This->num_faces = entry->num_faces;
++            This->family_name = face_cache_dup_name( entry->names[0] );
++            This->second_name = face_cache_dup_name( entry->names[1] );
++            This->style_name = face_cache_dup_name( entry->names[2] );
++            This->full_name = face_cache_dup_name( entry->names[3] );
++            This->ntm_flags = entry->ntm_flags;
++            This->weight = entry->weight;
++            This->font_version = entry->font_version;
++            This->fs = entry->fs;
++            This->size = entry->size;
++        }
++        pthread_mutex_unlock( &face_cache_lock );
++        return This;
++    }
++    face_cache_misses++;
++    pthread_mutex_unlock( &face_cache_lock );
++
++    This = unix_face_create_uncached( unix_name, NULL, 0, face_index, flags, &st );
++    if (!st.st_ino && !st.st_dev) return This; /* couldn't read it; don't remember that */
++    face_cache_set_key( &key, &st );
++
++    if (This)
++    {
++        names[0] = face_cache_dup_name( This->family_name );
++        names[1] = face_cache_dup_name( This->second_name );
++        names[2] = face_cache_dup_name( This->style_name );
++        names[3] = face_cache_dup_name( This->full_name );
++        if (!names[0] != !This->family_name || !names[1] != !This->second_name ||
++            !names[2] != !This->style_name || !names[3] != !This->full_name)
++        {
++            for (i = 0; i < ARRAY_SIZE(names); i++) free( names[i] );
++            return This;
++        }
++    }
++
++    pthread_mutex_lock( &face_cache_lock );
++    if (!face_cache_path) entry = NULL;
++    else if (!(entry = face_cache_find( unix_name, face_index, allow_bitmap )))
++        entry = face_cache_add( unix_name, face_index, allow_bitmap );
++    if (entry)
++    {
++        face_cache_free_names( entry );
++        entry->key = key;
++        entry->used = TRUE;
++        entry->valid = This != NULL;
++        entry->scalable = This ? This->scalable : FALSE;
++        entry->num_faces = This ? This->num_faces : 0;
++        entry->ntm_flags = This ? This->ntm_flags : 0;
++        entry->weight = This ? This->weight : 0;
++        entry->font_version = This ? This->font_version : 0;
++        if (This) entry->fs = This->fs;
++        else memset( &entry->fs, 0, sizeof(entry->fs) );
++        if (This) entry->size = This->size;
++        else memset( &entry->size, 0, sizeof(entry->size) );
++        memcpy( entry->names, names, sizeof(names) );
++        face_cache_dirty = TRUE;
++    }
++    else for (i = 0; i < ARRAY_SIZE(names); i++) free( names[i] );
++    pthread_mutex_unlock( &face_cache_lock );
++    return This;
++}
++
++/* Parse a font file or memory font. For a file, its fstat() result goes to
++ * *file_st, so the cache entry describes the exact file that was read; it is
++ * zeroed if the file couldn't be read at all, since that may not last. */
++static struct unix_face *unix_face_create_uncached( const char *unix_name, void *data_ptr, UINT data_size,
++                                                    UINT face_index, UINT flags, struct stat *file_st )
++{
+     static const WCHAR space_w[] = {' ',0};
+ 
+     const struct ttc_sfnt_v1 *ttc_sfnt_v1;
+@@ -902,19 +1333,29 @@
+ 
+     if (unix_name)
+     {
++        if (file_st) memset( file_st, 0, sizeof(*file_st) );
+         if ((fd = open( unix_name, O_RDONLY )) == -1) return NULL;
+         if (fstat( fd, &st ) == -1)
+         {
+             close( fd );
+             return NULL;
+         }
++        if (file_st) *file_st = st;
+         data_size = st.st_size;
+         data_ptr = mmap( NULL, data_size, PROT_READ, MAP_PRIVATE, fd, 0 );
+         close( fd );
+-        if (data_ptr == MAP_FAILED) return NULL;
++        if (data_ptr == MAP_FAILED)
++        {
++            if (file_st) memset( file_st, 0, sizeof(*file_st) );
++            return NULL;
++        }
+     }
+ 
+-    if (!(This = calloc( 1, sizeof(*This) ))) goto done;
++    if (!(This = calloc( 1, sizeof(*This) )))
++    {
++        if (file_st) memset( file_st, 0, sizeof(*file_st) );
++        goto done;
++    }
+ 
+     if (opentype_get_ttc_sfnt_v1( data_ptr, data_size, face_index, &face_count, &ttc_sfnt_v1 ) &&
+         opentype_get_tt_name_v0( data_ptr, data_size, ttc_sfnt_v1, &tt_name_v0 ) &&
+@@ -3881,6 +4322,7 @@
+ static const struct font_backend_funcs font_funcs =
+ {
+     freetype_load_fonts,
++    face_cache_flush,
+     fontconfig_enum_family_fallbacks,
+     freetype_add_font,
+     freetype_add_mem_font,
+--- a/dlls/win32u/ntgdi_private.h
++++ b/dlls/win32u/ntgdi_private.h
+@@ -320,6 +320,7 @@
+ struct font_backend_funcs
+ {
+     void  (*load_fonts)(void);
++    void  (*fonts_loaded)(void);
+     BOOL  (*enum_family_fallbacks)( UINT pitch_and_family, int index, WCHAR buffer[LF_FACESIZE] );
+     INT   (*add_font)( const WCHAR *file, UINT flags );
+     INT   (*add_mem_font)( void *ptr, SIZE_T size, UINT flags );
