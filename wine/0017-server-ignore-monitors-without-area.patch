@@ -1,0 +1,11 @@
+--- a/server/window.c
++++ b/server/window.c
+@@ -250,6 +250,8 @@
+         struct rectangle intersect, target = is_raw ? monitor->raw : monitor->virt;
+ 
+         if (monitor->flags & (MONITOR_FLAG_CLONE | MONITOR_FLAG_INACTIVE)) continue;
++        /* a display without a mode yet has no area to be in or near */
++        if (is_rect_empty( &target )) continue;
+ 
+         if (intersect_rect( &intersect, &target, rect ))
+         {
