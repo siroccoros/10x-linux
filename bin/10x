@@ -71,8 +71,8 @@ if [[ -n "$gpu" && -r "$sys/vendor" ]]; then
         export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/$egl.json
 fi
 
-# After a new Wine version the prefix gets updated (wine.inf's time differs
-# from the prefix's record). Do it before the session starts, without a
+# After an update of this package the prefix gets updated (wine.inf's time
+# differs from the prefix's record). Do it before the session starts, without a
 # display: Wine's graphical "configuration is being updated" run can hang.
 update_prefix() {
     local stamp
