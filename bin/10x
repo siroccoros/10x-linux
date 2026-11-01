@@ -71,7 +71,19 @@ if [[ -n "$gpu" && -r "$sys/vendor" ]]; then
         export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/$egl.json
 fi
 
+# After a new Wine version the prefix gets updated (wine.inf's time differs
+# from the prefix's record). Do it before the session starts, without a
+# display: Wine's graphical "configuration is being updated" run can hang.
+update_prefix() {
+    local stamp
+    stamp=$(head -c 20 "$WINEPREFIX/.update-timestamp" 2>/dev/null)
+    [[ "$stamp" == disable* || "$stamp" == "$(stat -c %Y "$wine_bin/../share/wine/wine.inf")"* ]] && return
+    env -u WAYLAND_DISPLAY -u DISPLAY wineboot -u > /dev/null 2>&1
+    wineserver -w
+}
+
 if [[ "$1" == --prewarm ]]; then
+    update_prefix
     # Keep the server up forever, boot the prefix's services, and hold the
     # desktop process open (Wine otherwise stops it when no program is left).
     # hold-desktop.exe says when the desktop is up, which tells systemd the
@@ -98,6 +110,7 @@ for p in $(pgrep -x wineserver); do
     fi
 done
 # Start the session if it isn't up; returns once it is.
+systemctl --user is-active -q 10x-prewarm.service || update_prefix
 systemctl --user start 10x-prewarm.service 2>/dev/null
 
 # 10x draws its own title bar: hide the buttons for window actions the

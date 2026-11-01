@@ -83,6 +83,9 @@ build() {
 package() {
   cd wine-build
   make DESTDIR="$pkgdir" install
+  # Prefixes are updated when wine.inf's time changes: give it the release's,
+  # so only a new Wine version updates them, not every rebuild.
+  touch -r "$srcdir/wine-$_winever/loader/wine.inf.in" "$pkgdir/opt/10x-linux/wine/share/wine/wine.inf"
 
   cd "$srcdir"
   install -Dm755 "$startdir/bin/10x" "$startdir/bin/10x-setup" -t "$pkgdir/usr/bin"
