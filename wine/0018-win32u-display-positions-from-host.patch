@@ -1,0 +1,76 @@
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -511,6 +511,19 @@
+            mode->dmPelsHeight == 0;
+ }
+ 
++static BOOL is_same_mode( const DEVMODEW *a, const DEVMODEW *b )
++{
++    static const UINT fields[] = {DM_DISPLAYORIENTATION, DM_BITSPERPEL, DM_PELSWIDTH, DM_PELSHEIGHT, DM_DISPLAYFREQUENCY};
++    POINTL pos_a = {0}, pos_b = {0};
++    UINT i;
++
++    for (i = 0; i < ARRAY_SIZE(fields); i++)
++        if (devmode_get( a, fields[i] ) != devmode_get( b, fields[i] )) return FALSE;
++    if (a->dmFields & DM_POSITION) pos_a = a->dmPosition;
++    if (b->dmFields & DM_POSITION) pos_b = b->dmPosition;
++    return pos_a.x == pos_b.x && pos_a.y == pos_b.y;
++}
++
+ static BOOL write_source_mode( HKEY hkey, UINT index, const DEVMODEW *mode )
+ {
+     WCHAR bufferW[MAX_PATH] = {0};
+@@ -2242,10 +2255,11 @@
+ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEVMODEW *host_modes, void *param )
+ {
+     struct device_manager_ctx *ctx = param;
+-    DEVMODEW dummy, physical, detached = *current, virtual, *virtual_modes = NULL;
++    DEVMODEW registry, physical, previous, detached = *current, virtual, *virtual_modes = NULL;
+     UINT virtual_count, modes_count = host_modes_count;
+     const DEVMODEW *modes = host_modes;
+     struct source *source;
++    BOOL has_previous;
+ 
+     TRACE( "current %s, host_modes_count %u, host_modes %p, param %p\n", debugstr_devmodew( current ),
+            host_modes_count, host_modes, param );
+@@ -2260,8 +2274,18 @@
+     }
+ 
+     physical = modes_count == 1 ? *modes : *current;
++    /* host modes have no position; the display's is in its current mode */
++    if (current->dmFields & DM_POSITION)
++    {
++        physical.dmFields |= DM_POSITION;
++        physical.dmPosition = current->dmPosition;
++    }
+     if (ctx->is_primary) ctx->primary = *current;
+ 
++    /* The settings last set from the host: those still equal to them weren't
++     * changed by a program, and follow the host (e.g. a display moved). */
++    has_previous = read_source_mode( source->key, WINE_ENUM_PHYSICAL_SETTINGS, &previous );
++
+     detached.dmPelsWidth = 0;
+     detached.dmPelsHeight = 0;
+     if (!(source->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) current = &detached;
+@@ -2273,7 +2297,8 @@
+     }
+     else
+     {
+-        if (!read_source_mode( source->key, ENUM_CURRENT_SETTINGS, &virtual ) || is_detached_mode( &virtual ))
++        if (!read_source_mode( source->key, ENUM_CURRENT_SETTINGS, &virtual ) || is_detached_mode( &virtual ) ||
++            (has_previous && is_same_mode( &virtual, &previous )))
+             virtual = physical;
+ 
+         if ((virtual_modes = get_virtual_modes( current, &physical, host_modes, host_modes_count, &virtual_count )))
+@@ -2286,8 +2311,10 @@
+         }
+     }
+ 
+-    if (current == &detached || !read_source_mode( source->key, ENUM_REGISTRY_SETTINGS, &dummy ))
++    if (current == &detached || !read_source_mode( source->key, ENUM_REGISTRY_SETTINGS, &registry ))
+         write_source_mode( source->key, ENUM_REGISTRY_SETTINGS, current );
++    else if (has_previous && is_same_mode( &registry, &previous ))
++        write_source_mode( source->key, ENUM_REGISTRY_SETTINGS, &physical );
+     write_source_mode( source->key, ENUM_CURRENT_SETTINGS, current );
+ 
+     assert( !modes_count || modes->dmDriverExtra == 0 );
