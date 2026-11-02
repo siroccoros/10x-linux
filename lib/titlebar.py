@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Hide 10x's title-bar buttons for window actions the compositor lacks.
+"""Delete 10x's title-bar window buttons: the window manager handles them.
 
-10x draws its own title bar. Toolkits show a minimise or maximise button
-only when the Wayland compositor offers that action (xdg_toplevel
-wm_capabilities); a button the compositor can't honour desyncs 10x from its
-window (e.g. "minimised" with no minimised state). The launcher passes the
-actions to hide. 10x looks for each UI file on disk (relative to its
-install directory) before falling back to its packed 10x.data, so this
-writes an edited copy of the main window layout to
+10x draws its own title bar with minimise, maximise/restore and close
+buttons. On Linux the compositor owns those actions (its decorations, keys
+and gestures), so the buttons are removed from 10x's layout (all but one,
+which 10x needs, and which is hidden instead); the items that sat left of
+them move right into the space. 10x looks for each UI file on
+disk (relative to its install directory) before falling back to its packed
+10x.data, so this writes an edited copy of the main window layout to
 <install>/UI/10X.ui_proj_bin. 10x.exe itself is never modified.
 
 The edit is regenerated from the installed 10x.data whenever 10x updates,
@@ -22,31 +22,36 @@ repeating 8-byte key:
     6 bytes (zero)
     count x (u64 file offset, u64 size, u64 FILETIME)
 
-10X.ui_proj_bin ("uiprojbin", version 4) element header:
-    u32 type, u32 nchars incl. NUL, UTF-16LE name, i32 x, y, w, h
-Title-bar elements are anchored to the right edge, x measured from it.
+10X.ui_proj_bin ("uiprojbin", version 4): a root record, then its element
+tree in pre-order. Each element's record:
+    u32 type, u32 nchars incl. NUL, UTF-16LE name, i32 x, y, w, h,
+    properties (by type), u32 number of children
+and its children's records follow it. Title-bar elements are anchored to the
+right edge, x measured from it.
 
-Usage: titlebar.py <10x install dir> <stamp file> [minimize] [maximize]
-(no-op when already current)
+Usage: titlebar.py <10x install dir> <stamp file>   (no-op when already current)
 """
 import os
+import re
 import struct
 import sys
 
 MAGIC = b'puredev_package\0'
 KNOWN_KEY = bytes.fromhex('47bc8d47f33bae15')
 LAYOUT = 'UI/10X.ui_proj_bin'
+# Candidate element headers: u32 type, u32 nchars incl. NUL; names are
+# identifiers, sometimes with spaces ("TabbedPanel Main Panel", menu
+# separators are "object").
+HEADER = re.compile(rb'(?=[\x01-\x40]\0\0\0[\x02-\x40]\0\0\0)')
+NAME = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_ ]{1,60}')
 
-# The buttons for each action; restore is maximise's other state, in the
-# same place. Close is always available.
-ACTIONS = {
-    'minimize': ('WindowMinimiseButton',),
-    'maximize': ('WindowMaximiseButton', 'WindowRestoreButton'),
-}
+# Restore is maximise's other state, in the same place.
 BUTTONS = ('WindowMinimiseButton', 'WindowMaximiseButton',
            'WindowRestoreButton', 'WindowCloseButton')
+# 10x needs this one in the main window's title bar to start.
+KEEP = 'WindowMinimiseButton'
 # Right-anchored title-bar items that sit left of the buttons; they move
-# right into the space hidden buttons leave. Each must occur exactly once.
+# right into the space the buttons leave. Each must occur exactly once.
 SHIFT = ('SearchButton', 'WorkspaceTreeButton', 'UpdateButton',
          'LicenseExpiredButton', 'ProgressBarPanel')
 
@@ -125,26 +130,69 @@ def read_layout(data_path):
     raise Unfamiliar('could not decode 10x.data')
 
 
-def find_elements(layout, name):
-    """Geometry offsets of every element header called `name`."""
-    pat = struct.pack('<I', len(name) + 1) + (name + '\0').encode('utf-16-le')
-    out, i = [], layout.find(pat)
-    while i >= 0:
-        if i >= 4:
-            t, = struct.unpack_from('<I', layout, i - 4)
-            if 1 <= t <= 64:
-                out.append(i + len(pat))
-        i = layout.find(pat, i + 1)
-    return out
+def elements(layout):
+    """The element tree: [(offset, type, name, end, children)] for the root's
+    children, where [offset, end) is the element's own record. Raises
+    Unfamiliar unless every record is accounted for, which no false header
+    match survives."""
+    heads = []
+    for m in HEADER.finditer(layout):
+        i = m.start()
+        t, n = struct.unpack_from('<II', layout, i)
+        raw = layout[i + 8:i + 8 + 2 * n]
+        if len(raw) < 2 * n or raw[-2:] != b'\0\0' or len(layout) < i + 8 + 2 * n + 16:
+            continue
+        try:
+            name = raw[:-2].decode('utf-16-le')
+        except UnicodeDecodeError:
+            continue
+        if not NAME.fullmatch(name) or name.lower().endswith('png'):
+            continue
+        if all(-20000 < v < 20000 for v in struct.unpack_from('<iiii', layout, i + 8 + 2 * n)):
+            heads.append((i, t, name))
+    if not heads:
+        raise Unfamiliar('no elements')
+    ends = [h[0] for h in heads[1:]] + [len(layout)]
+    count = lambda end: struct.unpack_from('<I', layout, end - 4)[0]
+
+    k = 0
+    def node():
+        nonlocal k
+        i, t, name = heads[k]
+        end = ends[k]
+        k += 1
+        kids = []
+        for _ in range(count(end)):
+            if k == len(heads):
+                raise Unfamiliar(f'{name}: fewer elements than it says it holds')
+            kids.append(node())
+        return i, t, name, end, kids
+
+    roots = [node() for _ in range(count(heads[0][0]))]
+    if k != len(heads):
+        raise Unfamiliar(f'{len(heads) - k} elements outside the tree')
+    return roots
 
 
-def patch(layout, hide):
+def walk(nodes, parent=None):
+    for nd in nodes:
+        yield nd, parent
+        yield from walk(nd[4], nd)
+
+
+def find_elements(tree, name):
+    """Geometry offsets of every element called `name`."""
+    return [i + 8 + 2 * (len(name) + 1) for (i, _, n, _, _), _ in walk(tree) if n == name]
+
+
+def patch(layout):
     if layout[:9] != b'uiprojbin' or layout[9:13] != struct.pack('<I', 4):
         raise Unfamiliar('layout format/version changed')
     d = bytearray(layout)
     geo = lambda g: struct.unpack_from('<iiii', d, g)
+    tree = elements(d)
 
-    buttons = {n: find_elements(d, n) for n in BUTTONS}
+    buttons = {n: find_elements(tree, n) for n in BUTTONS}
     for n, gs in buttons.items():
         if not gs:
             raise Unfamiliar(f'{n} not found')
@@ -152,71 +200,71 @@ def patch(layout, hide):
             x, y, w, h = geo(g)
             if not (0 <= x <= 200 and 0 <= y <= 4 and 0 < w <= 80 and 0 < h <= 60):
                 raise Unfamiliar(f'{n} has unexpected geometry {x, y, w, h}')
-    # Button slots from the right edge: (x, far edge). Each hidden slot
-    # frees its width plus the gap to the slot on its right.
-    slots = sorted({(geo(g)[0], geo(g)[0] + geo(g)[2]) for gs in buttons.values() for g in gs})
-    hidden_names = {n for a in hide for n in ACTIONS[a]}
-    hidden = {(geo(g)[0], geo(g)[0] + geo(g)[2]) for n in hidden_names for g in buttons[n]}
-    freed = []
-    for i, (x, far) in enumerate(slots):
-        if (x, far) in hidden:
-            freed.append((far, far - (slots[i - 1][1] if i else 0)))
-    strip = slots[-1][1]
+    # The items left of the buttons move right by the strip the buttons
+    # took, from the right edge to the far edge of the leftmost one.
+    strip = max(geo(g)[0] + geo(g)[2] for gs in buttons.values() for g in gs)
 
-    def shift(x):
-        return sum(width for far, width in freed if far <= x)
-
-    moved = {n: find_elements(d, n) for n in SHIFT}
+    moved = {n: find_elements(tree, n) for n in SHIFT}
     for n, gs in moved.items():
         if len(gs) != 1:
             raise Unfamiliar(f'{n} found {len(gs)} times, expected 1')
         x, y, w, h = geo(gs[0])
         if not (strip <= x <= 1000 and 0 <= y <= 4):
             raise Unfamiliar(f'{n} has unexpected geometry {x, y, w, h}')
-
-    for n, gs in buttons.items():
-        for g in gs:
-            if n in hidden_names:
-                # Far outside the window with no size: not drawn, not clickable.
-                struct.pack_into('<iiii', d, g, -10000, 0, 0, 0)
-            else:
-                x, = struct.unpack_from('<i', d, g)
-                struct.pack_into('<i', d, g, x - shift(x))
     for (g,) in moved.values():
         x, = struct.unpack_from('<i', d, g)
-        struct.pack_into('<i', d, g, x - shift(x))
-    return bytes(d)
+        struct.pack_into('<i', d, g, x - strip)
+
+    # Cut each button's record and take it off its parent's child count,
+    # from the end of the file back so earlier offsets stay valid. The main
+    # window's minimise button is the exception: 10x won't start without it,
+    # so it stays, far outside the window with no size (not drawn, not
+    # clickable).
+    main_bars = [nd for root in tree for nd in root[4]]
+    cuts = []
+    for (i, _, n, end, kids), parent in walk(tree):
+        if n not in BUTTONS:
+            continue
+        if kids or parent is None:
+            raise Unfamiliar(f'{n} at {i} is not a leaf of the title bar')
+        if n == KEEP and parent in main_bars:
+            struct.pack_into('<iiii', d, i + 8 + 2 * (len(n) + 1), -10000, 0, 0, 0)
+        else:
+            cuts.append((i, end, parent[3] - 4))
+    if len(cuts) == sum(map(len, buttons.values())):
+        raise Unfamiliar(f'no {KEEP} in the main title bar')
+    for i, end, count_at in sorted(cuts, reverse=True):
+        del d[i:end]
+        c, = struct.unpack_from('<I', d, count_at)
+        struct.pack_into('<I', d, count_at, c - 1)
+
+    out = bytes(d)
+    left = {n for (_, _, n, _, _), _ in walk(elements(out))}
+    if left & set(BUTTONS) != {KEEP} or len(list(walk(elements(out)))) != len(list(walk(tree))) - len(cuts):
+        raise Unfamiliar('edited layout does not parse as expected')
+    return out
 
 
 def main():
     install, stamp_path = sys.argv[1:3]
-    hide = sorted(set(sys.argv[3:]))
-    if any(a not in ACTIONS for a in hide):
-        print(f'titlebar.py: actions are {", ".join(ACTIONS)}', file=sys.stderr)
-        return 2
     data_path = os.path.join(install, '10x.data')
     target = os.path.join(install, *LAYOUT.split('/'))
 
     # Same format the launcher checks in bash: 10x.data size and mtime, this
-    # script's mtime (so an updated script regenerates the layout), the
-    # hidden actions.
+    # script's mtime (so an updated script regenerates the layout).
     st = os.stat(data_path)
-    stamp = f'{st.st_size} {int(st.st_mtime)} {int(os.stat(__file__).st_mtime)} {" ".join(hide)}'.rstrip()
+    stamp = f'{st.st_size} {int(st.st_mtime)} {int(os.stat(__file__).st_mtime)}'
     try:
         prev = open(stamp_path).read()
     except OSError:
         prev = None
-    if prev == stamp and (os.path.exists(target) or not hide):
+    if prev == stamp and os.path.exists(target):
         return 0
     if prev == 'stock ' + stamp:
         return 0  # Already fell back (and said so) for this 10x version.
 
-    if not hide:
-        remove(target)
-        write_stamp(stamp_path, stamp)
-        return 0
     try:
-        new = patch(read_layout(data_path), hide)
+        new = patch(read_layout(data_path))
     except Unfamiliar as e:
         # Stock title bar beats a layout we don't understand.
         remove(target)

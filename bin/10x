@@ -37,12 +37,8 @@ fi
 export WINEDLLOVERRIDES="winemenubuilder.exe=d;winebus.sys=d;wineusb.sys=d;winebth.sys=d"
 export DXVK_LOG_LEVEL=none
 
-caps=
 while read -r key value; do
-    case "$key" in
-        gpu) gpu=$value ;;
-        capabilities) caps=" $value " ;;
-    esac
+    [[ "$key" == gpu ]] && gpu=$value
 done < <("$lib/compositor-info" 2>/dev/null)
 
 # Render on the GPU the compositor displays with, as native Wayland programs
@@ -159,22 +155,16 @@ if ! systemctl --user is-active -q 10x-prewarm.service; then
     systemctl --user start 10x-prewarm.service 2>/dev/null
 fi
 
-# 10x draws its own title bar: hide the buttons for window actions the
-# compositor doesn't offer, as toolkits do (an edited layout, regenerated
-# after each 10x update; see titlebar.py). The stamp check is done here so an
-# unchanged 10x costs no Python start-up.
-hide=()
-if [[ -n "$caps" ]]; then
-    [[ "$caps" == *" minimize "* ]] || hide+=(minimize)
-    [[ "$caps" == *" maximize "* ]] || hide+=(maximize)
-fi
+# 10x draws its own title bar: its window buttons are deleted, the window
+# manager handles those actions (an edited layout, regenerated after each 10x
+# update; see titlebar.py). The stamp check is done here so an unchanged 10x
+# costs no Python start-up.
 tb_stamp_file="$WINEPREFIX/.10x-titlebar"
-tb_stamp="$(stat -c '%s %Y' "$install_dir/10x.data" 2>/dev/null) $(stat -c %Y "$share/titlebar.py") ${hide[*]}"
-tb_stamp=${tb_stamp% }
+tb_stamp="$(stat -c '%s %Y' "$install_dir/10x.data" 2>/dev/null) $(stat -c %Y "$share/titlebar.py")"
 tb_prev=$(cat "$tb_stamp_file" 2>/dev/null)
-if ! [[ ( "$tb_prev" == "$tb_stamp" && ( -f "$install_dir/UI/10X.ui_proj_bin" || ${#hide[@]} == 0 ) ) ||
+if ! [[ ( "$tb_prev" == "$tb_stamp" && -f "$install_dir/UI/10X.ui_proj_bin" ) ||
         "$tb_prev" == "stock $tb_stamp" ]]; then
-    if ! python3 -I "$share/titlebar.py" "$install_dir" "$tb_stamp_file" "${hide[@]}" 2>/dev/null; then
+    if ! python3 -I "$share/titlebar.py" "$install_dir" "$tb_stamp_file" 2>/dev/null; then
         notify-send -a 10x "10x" "This 10x version's layout is unfamiliar, so its own title-bar buttons are back." 2>/dev/null
     fi
 fi
