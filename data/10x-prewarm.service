@@ -8,6 +8,9 @@ Type=notify
 NotifyAccess=all
 ExecStart=/usr/bin/10x --prewarm
 ExecStop=/usr/bin/10x --stop
+# The first start after an update of the package updates the prefix first
+# (~10-20 s), past the 15 s default some distributions set (CachyOS).
+TimeoutStartSec=2min
 Restart=on-failure
 RestartSec=5
 

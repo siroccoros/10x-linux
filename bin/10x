@@ -74,12 +74,16 @@ fi
 # After an update of this package the prefix gets updated (wine.inf's time
 # differs from the prefix's record). Do it before the session starts, without a
 # display: Wine's graphical "configuration is being updated" run can hang.
+# Wine writes its .update-timestamp when an update starts, so an update that
+# was interrupted (e.g. its service timed out) would count as done: completion
+# is recorded separately, once the prefix has settled.
 update_prefix() {
-    local stamp
-    stamp=$(head -c 20 "$WINEPREFIX/.update-timestamp" 2>/dev/null)
-    [[ "$stamp" == disable* || "$stamp" == "$(stat -c %Y "$wine_bin/../share/wine/wine.inf")"* ]] && return
+    local inf_time done_file="$WINEPREFIX/.10x-updated"
+    [[ "$(head -c 7 "$WINEPREFIX/.update-timestamp" 2>/dev/null)" == disable ]] && return
+    inf_time=$(stat -c %Y "$wine_bin/../share/wine/wine.inf")
+    [[ "$(cat "$done_file" 2>/dev/null)" == "$inf_time" ]] && return
     env -u WAYLAND_DISPLAY -u DISPLAY wineboot -u > /dev/null 2>&1
-    wineserver -w
+    wineserver -w && echo "$inf_time" > "$done_file"
 }
 
 # Which Wine build the running session was started with (by --prewarm).
