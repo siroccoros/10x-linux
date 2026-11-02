@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""Hide 10x's title-bar buttons for window actions the compositor lacks.
+"""Delete 10x's title-bar window buttons: the window manager handles them.
 
-10x draws its own title bar. Toolkits show a minimise or maximise button
-only when the Wayland compositor offers that action (xdg_toplevel
-wm_capabilities); a button the compositor can't honour desyncs 10x from its
-window (e.g. "minimised" with no minimised state). The launcher passes the
-actions to hide. 10x looks for each UI file on disk (relative to its
-install directory) before falling back to its packed 10x.data, so this
-writes an edited copy of the main window layout to
-<install>/UI/10X.ui_proj_bin. 10x.exe itself is never modified.
+10x draws its own title bar with minimise, maximise/restore and close
+buttons. On Linux the compositor owns those actions (its decorations, keys
+and gestures), so the buttons are removed from 10x's layout; the items that
+sat left of them move right into the space. 10x looks for each UI file on
+disk (relative to its install directory) before falling back to its packed
+10x.data, so this writes an edited copy of the main window layout to
+<install>/UI/10X.ui_proj_bin.
 
-The edit is regenerated from the installed 10x.data whenever 10x updates,
-so a newer layout is never masked by a stale one. If anything about the
-package or layout looks unfamiliar, the override is removed instead and 10x
-shows its stock title bar.
+10x.exe gets one fix so it runs without the minimise button: its title-bar
+layout reads the button's position (the left edge of the controls on the
+right, which the menu must not run into) without checking the lookup found
+it, unlike every other lookup of a window button. That read becomes a call
+to a routine in int3 padding that checks first; with no button there is
+nothing on the right to run into. The rest of 10x.exe is left as it is
+(including any patches of the user's own).
+
+The edits are redone whenever 10x.data or 10x.exe changes, so a newer layout
+is never masked by a stale one. If anything about the package, layout or
+executable looks unfamiliar, nothing is patched: the layout override is
+removed and 10x shows its stock title bar.
 
 10x.data ("puredev_package"): 16-byte magic, then everything XORed with a
 repeating 8-byte key:
@@ -22,31 +29,55 @@ repeating 8-byte key:
     6 bytes (zero)
     count x (u64 file offset, u64 size, u64 FILETIME)
 
-10X.ui_proj_bin ("uiprojbin", version 4) element header:
-    u32 type, u32 nchars incl. NUL, UTF-16LE name, i32 x, y, w, h
-Title-bar elements are anchored to the right edge, x measured from it.
+10X.ui_proj_bin ("uiprojbin", version 4): a root record, then its element
+tree in pre-order. Each element's record:
+    u32 type, u32 nchars incl. NUL, UTF-16LE name, i32 x, y, w, h,
+    properties (by type), u32 number of children
+and its children's records follow it. Title-bar elements are anchored to the
+right edge, x measured from it.
 
-Usage: titlebar.py <10x install dir> <stamp file> [minimize] [maximize]
-(no-op when already current)
+Usage: titlebar.py <10x install dir> <stamp file>   (no-op when already current)
 """
 import os
+import re
 import struct
 import sys
 
 MAGIC = b'puredev_package\0'
 KNOWN_KEY = bytes.fromhex('47bc8d47f33bae15')
 LAYOUT = 'UI/10X.ui_proj_bin'
+# Candidate element headers: u32 type, u32 nchars incl. NUL; names are
+# identifiers, sometimes with spaces ("TabbedPanel Main Panel", menu
+# separators are "object").
+HEADER = re.compile(rb'(?=[\x01-\x40]\0\0\0[\x02-\x40]\0\0\0)')
+NAME = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_ ]{1,60}')
 
-# The buttons for each action; restore is maximise's other state, in the
-# same place. Close is always available.
-ACTIONS = {
-    'minimize': ('WindowMinimiseButton',),
-    'maximize': ('WindowMaximiseButton', 'WindowRestoreButton'),
-}
+# Restore is maximise's other state, in the same place.
 BUTTONS = ('WindowMinimiseButton', 'WindowMaximiseButton',
            'WindowRestoreButton', 'WindowCloseButton')
+
+# The executable fix (see the module docstring). Each use of the minimise
+# button's name is `lea rdx, name`, then the element lookup by name:
+#   checked:   mov rcx,[rcx+58h]; call find; mov rcx,rax; test rcx,rcx
+#   unchecked: mov rcx,[rax]; mov rcx,[rcx+58h]; call find; mov rcx,rax;
+#              jmp USE
+# USE (also reached with rcx = 0 when the window isn't found):
+#   mov rax,[r13+18h]; lea rdx,[rsp+70h]; mov r12d,[rcx+190h]
+# and the last instruction becomes `call CHECKED_READ; nop`.
+EXE = '10x.exe'
+MINIMISE = 'WindowMinimiseButton'
+LEA_RDX = re.compile(rb'(?=\x48\x8d\x15)')
+CHECKED = re.compile(rb'\x48\x8b\x49\x58\xe8(.{4})\x48\x8b\xc8\x48\x85\xc9', re.S)
+UNCHECKED = re.compile(rb'\x48\x8b\x08\x48\x8b\x49\x58\xe8(.{4})\x48\x8b\xc8\xe9(.{4})', re.S)
+USE = bytes.fromhex('498b4518 488d542470')
+READ = bytes.fromhex('448ba190010000')                  # mov r12d,[rcx+190h]
+CHECKED_READ = (bytes.fromhex('41bcffffff7f')           # mov r12d,7fffffffh
+                + bytes.fromhex('4885c9 7407')          # test rcx,rcx; je ret
+                + READ + b'\xc3')
+NOP2 = b'\x66\x90'
+
 # Right-anchored title-bar items that sit left of the buttons; they move
-# right into the space hidden buttons leave. Each must occur exactly once.
+# right into the space the buttons leave. Each must occur exactly once.
 SHIFT = ('SearchButton', 'WorkspaceTreeButton', 'UpdateButton',
          'LicenseExpiredButton', 'ProgressBarPanel')
 
@@ -125,26 +156,69 @@ def read_layout(data_path):
     raise Unfamiliar('could not decode 10x.data')
 
 
-def find_elements(layout, name):
-    """Geometry offsets of every element header called `name`."""
-    pat = struct.pack('<I', len(name) + 1) + (name + '\0').encode('utf-16-le')
-    out, i = [], layout.find(pat)
-    while i >= 0:
-        if i >= 4:
-            t, = struct.unpack_from('<I', layout, i - 4)
-            if 1 <= t <= 64:
-                out.append(i + len(pat))
-        i = layout.find(pat, i + 1)
-    return out
+def elements(layout):
+    """The element tree: [(offset, type, name, end, children)] for the root's
+    children, where [offset, end) is the element's own record. Raises
+    Unfamiliar unless every record is accounted for, which no false header
+    match survives."""
+    heads = []
+    for m in HEADER.finditer(layout):
+        i = m.start()
+        t, n = struct.unpack_from('<II', layout, i)
+        raw = layout[i + 8:i + 8 + 2 * n]
+        if len(raw) < 2 * n or raw[-2:] != b'\0\0' or len(layout) < i + 8 + 2 * n + 16:
+            continue
+        try:
+            name = raw[:-2].decode('utf-16-le')
+        except UnicodeDecodeError:
+            continue
+        if not NAME.fullmatch(name) or name.lower().endswith('png'):
+            continue
+        if all(-20000 < v < 20000 for v in struct.unpack_from('<iiii', layout, i + 8 + 2 * n)):
+            heads.append((i, t, name))
+    if not heads:
+        raise Unfamiliar('no elements')
+    ends = [h[0] for h in heads[1:]] + [len(layout)]
+    count = lambda end: struct.unpack_from('<I', layout, end - 4)[0]
+
+    k = 0
+    def node():
+        nonlocal k
+        i, t, name = heads[k]
+        end = ends[k]
+        k += 1
+        kids = []
+        for _ in range(count(end)):
+            if k == len(heads):
+                raise Unfamiliar(f'{name}: fewer elements than it says it holds')
+            kids.append(node())
+        return i, t, name, end, kids
+
+    roots = [node() for _ in range(count(heads[0][0]))]
+    if k != len(heads):
+        raise Unfamiliar(f'{len(heads) - k} elements outside the tree')
+    return roots
 
 
-def patch(layout, hide):
+def walk(nodes, parent=None):
+    for nd in nodes:
+        yield nd, parent
+        yield from walk(nd[4], nd)
+
+
+def find_elements(tree, name):
+    """Geometry offsets of every element called `name`."""
+    return [i + 8 + 2 * (len(name) + 1) for (i, _, n, _, _), _ in walk(tree) if n == name]
+
+
+def patch(layout):
     if layout[:9] != b'uiprojbin' or layout[9:13] != struct.pack('<I', 4):
         raise Unfamiliar('layout format/version changed')
     d = bytearray(layout)
     geo = lambda g: struct.unpack_from('<iiii', d, g)
+    tree = elements(d)
 
-    buttons = {n: find_elements(d, n) for n in BUTTONS}
+    buttons = {n: find_elements(tree, n) for n in BUTTONS}
     for n, gs in buttons.items():
         if not gs:
             raise Unfamiliar(f'{n} not found')
@@ -152,71 +226,190 @@ def patch(layout, hide):
             x, y, w, h = geo(g)
             if not (0 <= x <= 200 and 0 <= y <= 4 and 0 < w <= 80 and 0 < h <= 60):
                 raise Unfamiliar(f'{n} has unexpected geometry {x, y, w, h}')
-    # Button slots from the right edge: (x, far edge). Each hidden slot
-    # frees its width plus the gap to the slot on its right.
-    slots = sorted({(geo(g)[0], geo(g)[0] + geo(g)[2]) for gs in buttons.values() for g in gs})
-    hidden_names = {n for a in hide for n in ACTIONS[a]}
-    hidden = {(geo(g)[0], geo(g)[0] + geo(g)[2]) for n in hidden_names for g in buttons[n]}
-    freed = []
-    for i, (x, far) in enumerate(slots):
-        if (x, far) in hidden:
-            freed.append((far, far - (slots[i - 1][1] if i else 0)))
-    strip = slots[-1][1]
+    # The items left of the buttons move right by the strip the buttons
+    # took, from the right edge to the far edge of the leftmost one.
+    strip = max(geo(g)[0] + geo(g)[2] for gs in buttons.values() for g in gs)
 
-    def shift(x):
-        return sum(width for far, width in freed if far <= x)
-
-    moved = {n: find_elements(d, n) for n in SHIFT}
+    moved = {n: find_elements(tree, n) for n in SHIFT}
     for n, gs in moved.items():
         if len(gs) != 1:
             raise Unfamiliar(f'{n} found {len(gs)} times, expected 1')
         x, y, w, h = geo(gs[0])
         if not (strip <= x <= 1000 and 0 <= y <= 4):
             raise Unfamiliar(f'{n} has unexpected geometry {x, y, w, h}')
-
-    for n, gs in buttons.items():
-        for g in gs:
-            if n in hidden_names:
-                # Far outside the window with no size: not drawn, not clickable.
-                struct.pack_into('<iiii', d, g, -10000, 0, 0, 0)
-            else:
-                x, = struct.unpack_from('<i', d, g)
-                struct.pack_into('<i', d, g, x - shift(x))
     for (g,) in moved.values():
         x, = struct.unpack_from('<i', d, g)
-        struct.pack_into('<i', d, g, x - shift(x))
-    return bytes(d)
+        struct.pack_into('<i', d, g, x - strip)
+
+    # Cut each button's record and take it off its parent's child count,
+    # from the end of the file back so earlier offsets stay valid.
+    cuts = []
+    for (i, _, n, end, kids), parent in walk(tree):
+        if n not in BUTTONS:
+            continue
+        if kids or parent is None:
+            raise Unfamiliar(f'{n} at {i} is not a leaf of the title bar')
+        cuts.append((i, end, parent[3] - 4))
+    for i, end, count_at in sorted(cuts, reverse=True):
+        del d[i:end]
+        c, = struct.unpack_from('<I', d, count_at)
+        struct.pack_into('<I', d, count_at, c - 1)
+
+    out = bytes(d)
+    left = list(walk(elements(out)))
+    if any(n in BUTTONS for (_, _, n, _, _), _ in left) or len(left) != len(list(walk(tree))) - len(cuts):
+        raise Unfamiliar('edited layout does not parse as expected')
+    return out
+
+
+class PE:
+    """The sections of a 64-bit PE image, and file offset <-> RVA."""
+
+    def __init__(self, exe):
+        try:
+            if exe[:2] != b'MZ':
+                raise Unfamiliar(f'{EXE} is not a PE image')
+            pe, = struct.unpack_from('<I', exe, 0x3c)
+            if exe[pe:pe + 4] != b'PE\0\0' or struct.unpack_from('<H', exe, pe + 4)[0] != 0x8664:
+                raise Unfamiliar(f'{EXE} is not an x64 PE image')
+            nsec, = struct.unpack_from('<H', exe, pe + 6)
+            optsize, = struct.unpack_from('<H', exe, pe + 20)
+            opt = pe + 24
+            if struct.unpack_from('<H', exe, opt)[0] != 0x20b:
+                raise Unfamiliar(f'{EXE} is not PE32+')
+            self.base, = struct.unpack_from('<Q', exe, opt + 24)
+            # Data directory 3: the exception table (RUNTIME_FUNCTIONs).
+            exc_rva, exc_size = struct.unpack_from('<II', exe, opt + 112 + 3 * 8)
+            self.sections = {}
+            for k in range(nsec):
+                s = opt + optsize + 40 * k
+                name = exe[s:s + 8].rstrip(b'\0').decode('ascii', 'replace')
+                vsize, rva, rawsize, raw = struct.unpack_from('<IIII', exe, s + 8)
+                self.sections[name] = (rva, raw, min(vsize, rawsize))
+            for name in ('.text', '.rdata'):
+                if name not in self.sections:
+                    raise Unfamiliar(f'{EXE} has no {name}')
+            exc = self.off(exc_rva)
+            self.functions = sorted(
+                f[:2] for f in struct.iter_unpack('<III', exe[exc:exc + exc_size - exc_size % 12]) if f[0])
+        except struct.error as e:
+            raise Unfamiliar(f'{EXE} headers: {e}')
+
+    def off(self, rva):
+        for srva, raw, size in self.sections.values():
+            if srva <= rva < srva + size:
+                return raw + rva - srva
+        raise Unfamiliar(f'{EXE}: RVA {rva:#x} is outside the image')
+
+    def rva(self, off):
+        for srva, raw, size in self.sections.values():
+            if raw <= off < raw + size:
+                return srva + off - raw
+        raise Unfamiliar(f'{EXE}: offset {off:#x} is outside the image')
+
+    def span(self, name):
+        rva, raw, size = self.sections[name]
+        return raw, raw + size
+
+    def in_function(self, rva, n):
+        """Whether [rva, rva + n) overlaps any function's code."""
+        return any(b < rva + n and rva < e for b, e in self.functions)
+
+
+def patch_exe(exe):
+    """10x.exe with the minimise button's position read checked. Returns exe
+    itself when it already has the fix; raises Unfamiliar if it can't be
+    placed exactly."""
+    pe = PE(exe)
+    t0, t1 = pe.span('.text')
+    r0, r1 = pe.span('.rdata')
+    va = lambda off: pe.base + pe.rva(off)
+    rel = lambda at: struct.unpack_from('<i', exe, at)[0]
+
+    name = (MINIMISE + '\0').encode('utf-16-le')
+    names, i = [], exe.find(name, r0, r1)
+    while i >= 0:
+        names.append(i)
+        i = exe.find(name, i + 1, r1)
+    if len(names) != 1:
+        raise Unfamiliar(f'{MINIMISE} found {len(names)} times in {EXE}, expected 1')
+    name_rva = pe.rva(names[0])
+
+    # Every use of the name, each a lookup that checks its result but one.
+    checked, unchecked, finds = [], [], set()
+    for m in LEA_RDX.finditer(exe, t0, t1 - 7):
+        p = m.start()
+        if pe.rva(p) + 7 + rel(p + 3) != name_rva:
+            continue
+        for shape, into in ((CHECKED, checked), (UNCHECKED, unchecked)):
+            u = shape.match(exe, p + 7)
+            if u:
+                into.append(u)
+                finds.add(pe.rva(u.start(1)) + 4 + rel(u.start(1)))
+                break
+        else:
+            raise Unfamiliar(f'unfamiliar use of {MINIMISE} at {va(p):#x}')
+    if len(unchecked) != 1 or not checked or len(finds) != 1:
+        raise Unfamiliar(f'{MINIMISE}: {len(checked)} checked and {len(unchecked)} unchecked '
+                         f'lookups through {len(finds)} functions, expected 1+, 1, 1')
+    u, = unchecked
+    use = u.end() + rel(u.start(2))
+    if exe[use - 2:use] != b'\x33\xc9' or exe[use:use + len(USE)] != USE:
+        raise Unfamiliar(f'unfamiliar use of the minimise button at {va(use):#x}')
+    read = use + len(USE)
+
+    if exe[read:read + len(READ)] != READ:
+        # Already fixed: the call to CHECKED_READ, which must be intact.
+        cave = read + 5 + rel(read + 1) if exe[read] == 0xe8 else -1
+        if (exe[read + 5:read + 7] != NOP2 or not t0 <= cave <= t1 - len(CHECKED_READ)
+                or exe[cave:cave + len(CHECKED_READ)] != CHECKED_READ):
+            raise Unfamiliar(f'unfamiliar code at {va(read):#x}')
+        return exe
+
+    # CHECKED_READ goes in the first run of int3 padding (between
+    # functions, never executed) that holds it.
+    n = len(CHECKED_READ)
+    for m in re.finditer(rb'\xcc{%d,}' % n, exe[t0:t1]):
+        cave = t0 + m.start()
+        if not pe.in_function(pe.rva(cave), n):
+            break
+    else:
+        raise Unfamiliar(f'no {n} bytes of padding in {EXE} for the fix')
+    out = bytearray(exe)
+    out[cave:cave + n] = CHECKED_READ
+    out[read:read + 5] = b'\xe8' + struct.pack('<i', cave - (read + 5))
+    out[read + 5:read + 7] = NOP2
+    return bytes(out)
 
 
 def main():
     install, stamp_path = sys.argv[1:3]
-    hide = sorted(set(sys.argv[3:]))
-    if any(a not in ACTIONS for a in hide):
-        print(f'titlebar.py: actions are {", ".join(ACTIONS)}', file=sys.stderr)
-        return 2
     data_path = os.path.join(install, '10x.data')
+    exe_path = os.path.join(install, EXE)
     target = os.path.join(install, *LAYOUT.split('/'))
 
-    # Same format the launcher checks in bash: 10x.data size and mtime, this
-    # script's mtime (so an updated script regenerates the layout), the
-    # hidden actions.
-    st = os.stat(data_path)
-    stamp = f'{st.st_size} {int(st.st_mtime)} {int(os.stat(__file__).st_mtime)} {" ".join(hide)}'.rstrip()
+    # Same format the launcher checks in bash: 10x.data and 10x.exe size and
+    # mtime, this script's mtime (so an updated script redoes the edits).
+    def current():
+        d, e = os.stat(data_path), os.stat(exe_path)
+        return (f'{d.st_size} {int(d.st_mtime)} {e.st_size} {int(e.st_mtime)} '
+                f'{int(os.stat(__file__).st_mtime)}')
+    stamp = current()
     try:
         prev = open(stamp_path).read()
     except OSError:
         prev = None
-    if prev == stamp and (os.path.exists(target) or not hide):
+    if prev == stamp and os.path.exists(target):
         return 0
     if prev == 'stock ' + stamp:
         return 0  # Already fell back (and said so) for this 10x version.
 
-    if not hide:
-        remove(target)
-        write_stamp(stamp_path, stamp)
-        return 0
+    # Both edits or neither: the layout without the minimise button needs
+    # the fixed executable.
     try:
-        new = patch(read_layout(data_path), hide)
+        exe = open(exe_path, 'rb').read()
+        new_exe = patch_exe(exe)
+        new = patch(read_layout(data_path))
     except Unfamiliar as e:
         # Stock title bar beats a layout we don't understand.
         remove(target)
@@ -224,13 +417,21 @@ def main():
         print(f'titlebar.py: {e}; using the stock title bar', file=sys.stderr)
         return 1
 
+    if new_exe is not exe:
+        write_file(exe_path, new_exe, os.stat(exe_path).st_mode)
     os.makedirs(os.path.dirname(target), exist_ok=True)
-    tmp = target + '.tmp'
-    with open(tmp, 'wb') as f:
-        f.write(new)
-    os.replace(tmp, target)
-    write_stamp(stamp_path, stamp)
+    write_file(target, new)
+    write_stamp(stamp_path, current())  # 10x.exe's mtime has moved
     return 0
+
+
+def write_file(path, data, mode=None):
+    tmp = path + '.tmp'
+    with open(tmp, 'wb') as f:
+        f.write(data)
+    if mode is not None:
+        os.chmod(tmp, mode)
+    os.replace(tmp, path)
 
 
 def remove(path):

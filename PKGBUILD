@@ -71,13 +71,11 @@ build() {
 
   cd "$srcdir"
   x86_64-w64-mingw32-gcc -O2 -mwindows -o hold-desktop.exe "$startdir/lib/hold-desktop.c"
-  local p=/usr/share/wayland-protocols/stable
-  for x in "$p/xdg-shell/xdg-shell.xml" "$p/linux-dmabuf/linux-dmabuf-v1.xml"; do
-    wayland-scanner client-header "$x" "$(basename "$x" .xml)-client-protocol.h"
-    wayland-scanner private-code "$x" "$(basename "$x" .xml)-protocol.c"
-  done
+  local x=/usr/share/wayland-protocols/stable/linux-dmabuf/linux-dmabuf-v1.xml
+  wayland-scanner client-header "$x" linux-dmabuf-v1-client-protocol.h
+  wayland-scanner private-code "$x" linux-dmabuf-v1-protocol.c
   cc $CPPFLAGS $CFLAGS -I. -o compositor-info "$startdir/lib/compositor-info.c" \
-    xdg-shell-protocol.c linux-dmabuf-v1-protocol.c $LDFLAGS -lwayland-client
+    linux-dmabuf-v1-protocol.c $LDFLAGS -lwayland-client
 }
 
 package() {
