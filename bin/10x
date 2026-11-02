@@ -86,6 +86,39 @@ update_prefix() {
     wineserver -w && echo "$inf_time" > "$done_file"
 }
 
+# 10x can hang after its window closes: its log says "Exiting..." but the
+# process stays. It then holds the session (an updated Wine can't replace it)
+# and takes over the next start (a new 10x hands its files to the running one),
+# so 10x won't open until it's killed. A 10x that began exiting over 10 seconds
+# ago is ended. Its log is the one whose last "App Start" is when it started
+# (a second instance writes 10x_1.log).
+end_hung_exit() {
+    local pids pid started log line start exiting t
+    pids=($(pgrep -f 'PureDevSoftware.10x.10x\.exe'))
+    (( ${#pids[@]} == 1 )) || return
+    pid=${pids[0]}
+    tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep -qxF "WINEPREFIX=$WINEPREFIX" || return
+    started=$(date -d "$(ps -o lstart= -p "$pid")" +%s 2>/dev/null) || return
+    for log in "$WINEPREFIX/drive_c/users/$USER/AppData/Roaming/10x"/10x{,_*}.log; do
+        [[ -f "$log" ]] || continue
+        # "dd/mm/yyyy HH:MM:SS" of the last App Start, and of the first Exiting... after it
+        line=$(awk -F': ' '
+            /--------------- App Start/ { s = $1; e = "" }
+            /: Exiting\.\.\.\r?$/ && s != "" && e == "" { e = $1 }
+            END { print s "|" e }' "$log")
+        start=${line%%|*} exiting=${line#*|}
+        [[ -n "$start" ]] || continue
+        t=$(date -d "${start:6:4}-${start:3:2}-${start:0:2} ${start:11:8}" +%s 2>/dev/null) || continue
+        (( t - started >= -5 && t - started <= 60 )) || continue
+        [[ -n "$exiting" ]] || return
+        t=$(date -d "${exiting:6:4}-${exiting:3:2}-${exiting:0:2} ${exiting:11:8}" +%s 2>/dev/null) || return
+        (( $(date +%s) - t > 10 )) || return
+        kill -9 "$pid" 2>/dev/null
+        while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done
+        return
+    done
+}
+
 # Which Wine build the running session was started with (by --prewarm).
 run_stamp="${XDG_RUNTIME_DIR:-/tmp}/10x-wineserver"
 
@@ -102,6 +135,8 @@ if [[ "$1" == --prewarm ]]; then
         { read -r && systemd-notify --ready; cat > /dev/null; }
     exit
 fi
+
+end_hung_exit
 
 # The prefix's server must be this package's Wine: after an update of the
 # package the running one is the old build, which refuses the new client.
