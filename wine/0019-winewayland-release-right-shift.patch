@@ -1,0 +1,13 @@
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -685,7 +685,9 @@
+             input.ki.wVk = vkey;
+             input.ki.wScan = scan & 0xff;
+             input.ki.dwFlags = KEYEVENTF_KEYUP;
+-            if (scan & ~0xff) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
++            /* Right Shift (0x36) is pressed as an extended key, which is how
++             * wineserver tells it from Left Shift; release it the same way. */
++            if ((scan & ~0xff) || scan == 0x36) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+             NtUserSendHardwareInput(hwnd, 0, &input, 0);
+         }
+     }
